@@ -42,6 +42,8 @@ impl AfskDemodulator {
 }
 
 impl Demodulator for AfskDemodulator {
+    type Sample = f32;
+
     fn push_samples(&mut self, samples: &[f32]) -> Vec<u8> {
         let mut bits = Vec::new();
 

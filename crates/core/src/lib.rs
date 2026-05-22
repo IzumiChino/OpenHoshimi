@@ -5,7 +5,8 @@
 //! Three things live here:
 //!
 //! * The trait surface that defines the signal-processing pipeline
-//!   ([`InputSource`] -> [`Demodulator`] -> [`Framing`] -> [`TelemetrySchema`]).
+//!   ([`InputSource`] / [`IqSource`] -> [`Demodulator`] -> [`LineDecoder`] /
+//!   [`Descrambler`] -> [`Framing`] -> [`TelemetrySchema`]).
 //! * The shared data structures that flow between those stages
 //!   ([`Frame`], [`TelemetryField`], ...).
 //! * The TOML-driven satellite definition format (see [`satellite`]).
@@ -20,26 +21,67 @@ pub mod satellite;
 
 use std::time::SystemTime;
 
-/// Converts a stream of raw `f32` audio samples into a stream of soft bits.
+/// One complex IQ sample.
+///
+/// This crate keeps the type explicit instead of depending on an external
+/// complex-number package. It is equivalent to a `Complex<f32>` sample.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IqSample {
+    /// In-phase component.
+    pub i: f32,
+    /// Quadrature component.
+    pub q: f32,
+}
+
+/// Converts a stream of raw samples into a stream of recovered symbols.
 ///
 /// Implementations are stateful - call [`push_samples`](Self::push_samples)
-/// repeatedly as samples arrive. Each invocation may emit zero or more bits
-/// depending on how much of a bit period has accumulated internally. Each
-/// emitted byte is `0x00` or `0x01`, representing one recovered bit.
+/// repeatedly as samples arrive. Each invocation may emit zero or more
+/// recovered bits depending on how much of a symbol period has accumulated
+/// internally. Each emitted byte is `0x00` or `0x01`, representing one
+/// recovered bit.
 pub trait Demodulator: Send {
-    /// Push a chunk of audio samples through the demodulator and return any
-    /// bits that were recovered.
+    /// Sample type consumed by this demodulator.
+    type Sample: Copy + Send;
+
+    /// Push a chunk of samples through the demodulator and return any bits
+    /// that were recovered.
     ///
     /// The returned `Vec<u8>` contains one byte per recovered bit, valued
     /// `0x00` or `0x01`. The vector may be empty if not enough samples have
     /// been buffered to complete a bit yet.
-    fn push_samples(&mut self, samples: &[f32]) -> Vec<u8>;
+    fn push_samples(&mut self, samples: &[Self::Sample]) -> Vec<u8>;
 
-    /// Audio sample rate this demodulator was constructed for, in Hz.
+    /// Sample rate this demodulator was constructed for, in Hz.
     fn sample_rate(&self) -> u32;
 
     /// Symbol rate of the demodulated signal, in baud.
     fn baudrate(&self) -> u32;
+}
+
+/// Decodes a line-coded bit stream in place.
+///
+/// This trait is for hard line coding such as NRZI and NRZ-M / NRZ-S. It is
+/// separate from [`Descrambler`] because line coding and scrambling are
+/// different transforms.
+pub trait LineDecoder: Send {
+    /// Decode a bit stream in place.
+    fn decode(&mut self, bits: &mut [u8]);
+}
+
+/// Descrambles a hard bit stream in place.
+///
+/// This trait is for self-synchronising scramblers such as G3RUH or CCSDS
+/// randomizers.
+pub trait Descrambler: Send {
+    /// Descramble a bit stream in place.
+    fn descramble(&mut self, data: &mut [u8]);
+}
+
+/// Decodes a forward-error-correction block into plain bytes.
+pub trait Fec: Send {
+    /// Decode an FEC-protected block and return the recovered payload.
+    fn decode(&self, data: &[u8]) -> Result<Vec<u8>, DecodeError>;
 }
 
 /// Finds frame boundaries in a bit (or byte) stream and returns complete
@@ -79,6 +121,21 @@ pub trait InputSource: Send {
 
     /// Human-readable description of the source, e.g. `"WAV file
     /// recording.wav (48000 Hz, 16-bit, mono)"`.
+    fn description(&self) -> &str;
+}
+
+/// Provides a stream of complex IQ samples from any source.
+pub trait IqSource: Send {
+    /// Fill `buf` with up to `buf.len()` IQ samples and return how many were
+    /// actually written. Returning `0` is allowed for non-blocking sources
+    /// that have nothing buffered. To signal end of stream, return
+    /// [`IoError::EndOfStream`].
+    fn read_samples(&mut self, buf: &mut [IqSample]) -> Result<usize, IoError>;
+
+    /// Sample rate of the produced IQ stream, in Hz.
+    fn sample_rate(&self) -> u32;
+
+    /// Human-readable description of the source.
     fn description(&self) -> &str;
 }
 
