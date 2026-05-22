@@ -1,0 +1,12 @@
+[package]
+name = "openhoshimi-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "TOML-driven telemetry field parser for OpenHoshimi"
+
+[dependencies]
+openhoshimi-core = { workspace = true }

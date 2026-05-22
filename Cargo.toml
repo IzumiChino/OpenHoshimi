@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/dsp",
+    "crates/codec",
+    "crates/telemetry",
+    "crates/io",
+    "crates/app",
+    "tools/decode_file",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/openhoshimi/openhoshimi"
+authors = ["OpenHoshimi contributors"]
+
+[workspace.dependencies]
+openhoshimi-core = { path = "crates/core" }
+openhoshimi-dsp = { path = "crates/dsp" }
+openhoshimi-codec = { path = "crates/codec" }
+openhoshimi-telemetry = { path = "crates/telemetry" }
+openhoshimi-io = { path = "crates/io" }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+toml = "0.8"
+hound = "3"
+crc = "3"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.31"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

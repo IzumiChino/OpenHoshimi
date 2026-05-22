@@ -1,0 +1,21 @@
+[package]
+name = "openhoshimi-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "egui desktop application for OpenHoshimi"
+
+[[bin]]
+name = "openhoshimi"
+path = "src/main.rs"
+
+[dependencies]
+openhoshimi-core = { workspace = true }
+openhoshimi-dsp = { workspace = true }
+openhoshimi-codec = { workspace = true }
+openhoshimi-telemetry = { workspace = true }
+openhoshimi-io = { workspace = true }
+eframe = { workspace = true }

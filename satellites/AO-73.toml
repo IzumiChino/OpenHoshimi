@@ -1,0 +1,123 @@
+# AO-73 / FUNcube-1 satellite definition.
+#
+# Reference: https://www.amsat.org/two-way-satellites/ao-73-funcube-1/
+#            https://amsat-uk.org/satellites/comms/funcube-1/
+#            https://www.sigidwiki.com/wiki/FUNcube-1_Telemetry
+#
+# Launched 2013-11-21. 1200 bd BPSK educational telemetry beacon on
+# 145.935 MHz, encoded with the AMSAT AO-40 FEC scheme (256-byte payload
+# wrapped in CRC-16, scrambled, convolutionally coded with rate-1/2 K=7,
+# interleaved into a 5200-symbol block, then differentially BPSK
+# modulated). The mode-U/V linear transponder activates during eclipse.
+#
+# Telemetry field offsets below cover a representative subset of the
+# 256-byte FUNcube payload - not the full set. They are sufficient to
+# exercise the schema; the full RT/WO/HR layout will be filled in once
+# the Phase 3 telemetry parser lands.
+
+[satellite]
+name = "AO-73"
+aliases = ["FUNcube-1", "FN-1"]
+norad_id = 39444
+
+[[downlink]]
+label = "1k2 BPSK telemetry beacon"
+freq_hz = 145_935_000
+modulation = "DBPSK"
+baudrate = 1200
+framing = "AO40_FEC"
+telemetry_schema = "funcube_1"
+
+[telemetry.funcube_1]
+
+[[telemetry.funcube_1.field]]
+name = "frame_id"
+group = "header"
+offset = 0
+length = 1
+endian = "big"
+unit = ""
+
+[[telemetry.funcube_1.field]]
+name = "sequence"
+group = "header"
+offset = 1
+length = 2
+endian = "big"
+
+[[telemetry.funcube_1.field]]
+name = "bus_voltage"
+group = "eps"
+offset = 3
+length = 2
+endian = "big"
+scale = 0.001
+unit = "V"
+warn_below = 6.5
+warn_above = 8.4
+
+[[telemetry.funcube_1.field]]
+name = "bus_current"
+group = "eps"
+offset = 5
+length = 2
+endian = "big"
+scale = 0.001
+unit = "A"
+
+[[telemetry.funcube_1.field]]
+name = "solar_x_plus_voltage"
+group = "eps"
+offset = 7
+length = 2
+endian = "big"
+scale = 0.001
+unit = "V"
+
+[[telemetry.funcube_1.field]]
+name = "solar_x_minus_voltage"
+group = "eps"
+offset = 9
+length = 2
+endian = "big"
+scale = 0.001
+unit = "V"
+
+[[telemetry.funcube_1.field]]
+name = "temp_pa"
+group = "thermal"
+offset = 24
+length = 2
+endian = "big"
+scale = 0.1
+bias = -273.15
+unit = "C"
+warn_above = 50.0
+
+[[telemetry.funcube_1.field]]
+name = "temp_battery"
+group = "thermal"
+offset = 26
+length = 2
+endian = "big"
+scale = 0.1
+bias = -273.15
+unit = "C"
+warn_below = -10.0
+warn_above = 45.0
+
+[[telemetry.funcube_1.field]]
+name = "rx_doppler"
+group = "comms"
+offset = 30
+length = 2
+endian = "big"
+unit = "Hz"
+
+[[telemetry.funcube_1.field]]
+name = "rx_rssi"
+group = "comms"
+offset = 32
+length = 1
+endian = "big"
+unit = "dBm"

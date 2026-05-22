@@ -1,0 +1,13 @@
+[package]
+name = "openhoshimi-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Input sources (WAV, IQ files, soundcard) for OpenHoshimi"
+
+[dependencies]
+openhoshimi-core = { workspace = true }
+hound = { workspace = true }

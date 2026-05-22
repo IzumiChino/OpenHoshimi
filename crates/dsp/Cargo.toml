@@ -1,0 +1,13 @@
+[package]
+name = "openhoshimi-dsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Demodulators and bit-level processing for OpenHoshimi"
+
+[dependencies]
+openhoshimi-core = { workspace = true }
+crc = { workspace = true }

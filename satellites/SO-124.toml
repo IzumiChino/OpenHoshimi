@@ -1,0 +1,71 @@
+# SO-124 / HADES-R satellite definition.
+#
+# Reference: https://www.amsat.org/two-way-satellites/so-124-hades-r/
+#            https://www.amsat-ea.org/
+#            https://community.libre.space/ (HADES-R observation reports)
+#
+# 1.5P PocketQube built and operated by AMSAT-EA. Activated 2025-02-19.
+# Carries an FM voice repeater, an FSK telemetry/data downlink and a CW
+# beacon. Reported downlink centre is 436.885 MHz (with some thermal
+# drift, ~436.888 MHz observed in practice). FM repeater uplink is on
+# 145.925 MHz with 1750 Hz tone access.
+#
+# The FSK telemetry uses AMSAT-EA's own framing - distinct from AX.25 -
+# at 1200 bps. Until that framing has its own dedicated decoder, the
+# downlink is declared as Unknown framing so the pipeline still picks
+# it up but does not attempt to parse fields.
+
+[satellite]
+name = "SO-124"
+aliases = ["HADES-R", "AMSAT-EA HADES-R"]
+norad_id = 62686
+
+[[downlink]]
+label = "FM voice repeater downlink"
+freq_hz = 436_885_000
+modulation = "FM"
+baudrate = 1
+framing = "UNKNOWN"
+
+[[downlink]]
+label = "1k2 FSK telemetry"
+freq_hz = 436_885_000
+modulation = "FSK"
+baudrate = 1200
+framing = "UNKNOWN"
+telemetry_schema = "hades_r"
+
+[[downlink]]
+label = "CW beacon"
+freq_hz = 436_885_000
+modulation = "CW"
+baudrate = 20
+framing = "UNKNOWN"
+
+[telemetry.hades_r]
+
+# Placeholder telemetry layout. AMSAT-EA's full HADES-R frame format
+# will be wired in once the Phase 3 telemetry parser and the AMSAT-EA
+# framing decoder are implemented.
+
+[[telemetry.hades_r.field]]
+name = "bat_voltage"
+group = "eps"
+offset = 0
+length = 2
+endian = "big"
+scale = 0.01
+unit = "V"
+warn_below = 3.3
+warn_above = 4.2
+
+[[telemetry.hades_r.field]]
+name = "temp_obc"
+group = "thermal"
+offset = 2
+length = 2
+endian = "big"
+scale = 0.1
+unit = "C"
+warn_below = -20.0
+warn_above = 60.0
