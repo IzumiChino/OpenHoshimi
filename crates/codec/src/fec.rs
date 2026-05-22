@@ -29,6 +29,29 @@ impl Fec for ReedSolomon {
     }
 }
 
+/// Hard-decision Viterbi decoder for the CCSDS/AO-40 K=7, rate-1/2 code.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Viterbi;
+
+impl Viterbi {
+    /// Create a new stateless Viterbi decoder.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Decode one-bit-per-byte hard symbols into one-bit-per-byte payload
+    /// bits.
+    pub fn decode_bits(&self, symbols: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        viterbi::decode_bits(symbols)
+    }
+}
+
+impl Fec for Viterbi {
+    fn decode(&self, data: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        self.decode_bits(data)
+    }
+}
+
 pub(crate) mod ccsds_randomizer {
     const POLY_MASK: u8 = 0xa9;
     const INITIAL_STATE: u8 = 0xff;
@@ -63,6 +86,139 @@ pub(crate) mod ccsds_randomizer {
             xor_sequence(&mut data);
 
             assert_eq!(data, original);
+        }
+    }
+}
+
+pub(crate) mod viterbi {
+    use openhoshimi_core::DecodeError;
+
+    const STATES: usize = 64;
+    const K: usize = 7;
+    const G1: u8 = 0o171;
+    const G2: u8 = 0o133;
+    const INF: u32 = u32::MAX / 4;
+    const SECOND_SYMBOL_INVERTED: bool = true;
+
+    pub(crate) fn decode_bits(symbols: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        if symbols.len() < 2 || symbols.len() / 2 * 2 != symbols.len() {
+            return Err(DecodeError::InvalidEncoding(
+                "Viterbi input must contain pairs of symbols".to_string(),
+            ));
+        }
+
+        let steps = symbols.len() / 2;
+        let mut metrics = [INF; STATES];
+        metrics[0] = 0;
+        let mut decisions = vec![[0u8; STATES]; steps];
+
+        for step in 0..steps {
+            let received = [symbols[step * 2] & 1, symbols[step * 2 + 1] & 1];
+            let mut next_metrics = [INF; STATES];
+
+            for (state, metric) in metrics.iter().enumerate() {
+                if *metric == INF {
+                    continue;
+                }
+                for bit in 0..=1u8 {
+                    let next_state = ((state << 1) | usize::from(bit)) & (STATES - 1);
+                    let encoded = encode_branch(state as u8, bit);
+                    let branch_metric = u32::from(hamming2(received, encoded));
+                    let candidate = *metric + branch_metric;
+                    if candidate < next_metrics[next_state] {
+                        next_metrics[next_state] = candidate;
+                        decisions[step][next_state] = (state as u8) | (bit << 6);
+                    }
+                }
+            }
+
+            metrics = next_metrics;
+        }
+
+        let mut state = metrics
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, metric)| *metric)
+            .map(|(state, _)| state)
+            .ok_or_else(|| DecodeError::InvalidEncoding("empty Viterbi trellis".to_string()))?;
+
+        let mut decoded = vec![0u8; steps];
+        for step in (0..steps).rev() {
+            let decision = decisions[step][state];
+            decoded[step] = (decision >> 6) & 1;
+            state = usize::from(decision & 0x3f);
+        }
+
+        Ok(decoded)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_bits(bits: &[u8]) -> Vec<u8> {
+        let mut state = 0u8;
+        let mut out = Vec::with_capacity(bits.len() * 2);
+        for &bit in bits {
+            let encoded = encode_branch(state, bit & 1);
+            out.extend_from_slice(&encoded);
+            state = ((state << 1) | (bit & 1)) & ((1 << (K - 1)) - 1);
+        }
+        out
+    }
+
+    fn encode_branch(state: u8, bit: u8) -> [u8; 2] {
+        let register = ((state << 1) | (bit & 1)) & ((1 << K) - 1);
+        let second = if SECOND_SYMBOL_INVERTED {
+            parity(register & G2) ^ 1
+        } else {
+            parity(register & G2)
+        };
+        [parity(register & G1), second]
+    }
+
+    fn parity(value: u8) -> u8 {
+        (value.count_ones() & 1) as u8
+    }
+
+    fn hamming2(received: [u8; 2], expected: [u8; 2]) -> u8 {
+        u8::from(received[0] != expected[0]) + u8::from(received[1] != expected[1])
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn decodes_clean_symbols() {
+            let bits: Vec<u8> = (0..96).map(|i| u8::from(i % 5 == 0)).collect();
+            let symbols = encode_bits(&bits);
+            let decoded = match decode_bits(&symbols) {
+                Ok(decoded) => decoded,
+                Err(err) => panic!("valid Viterbi symbols: {err}"),
+            };
+
+            assert_eq!(decoded, bits);
+        }
+
+        #[test]
+        fn corrects_single_symbol_error() {
+            let bits: Vec<u8> = (0..128).map(|i| u8::from(i % 7 < 3)).collect();
+            let mut symbols = encode_bits(&bits);
+            symbols[17] ^= 1;
+            let decoded = match decode_bits(&symbols) {
+                Ok(decoded) => decoded,
+                Err(err) => panic!("correctable Viterbi symbols: {err}"),
+            };
+
+            assert_eq!(decoded, bits);
+        }
+
+        #[test]
+        fn rejects_odd_symbol_count() {
+            let err = match decode_bits(&[0, 1, 1]) {
+                Ok(_) => panic!("odd symbol count should fail"),
+                Err(err) => err,
+            };
+
+            assert!(matches!(err, DecodeError::InvalidEncoding(_)));
         }
     }
 }

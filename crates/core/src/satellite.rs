@@ -229,6 +229,13 @@ pub enum DescramblerDef {
 pub enum FramerDef {
     /// HDLC flag-based framing.
     Hdlc,
+    /// AO-40 distributed sync framing.
+    Ao40 {
+        /// Maximum number of bit errors allowed in the distributed sync
+        /// vector.
+        #[serde(default)]
+        threshold: usize,
+    },
     /// Fixed syncword followed by a fixed-size payload.
     Syncword {
         /// Syncword bits as ASCII `0` and `1` characters.
@@ -520,6 +527,14 @@ fn validate_modem(label: &str, modem: &ModemDef) -> Result<(), ConfigError> {
 fn validate_framer(label: &str, framer: &FramerDef) -> Result<(), ConfigError> {
     match framer {
         FramerDef::Hdlc => {}
+        FramerDef::Ao40 { threshold } => {
+            if *threshold > 65 {
+                return invalid_value(
+                    format!("downlink[{label}].framer.threshold"),
+                    "must be <= 65",
+                );
+            }
+        }
         FramerDef::Syncword {
             syncword,
             threshold,
@@ -626,10 +641,8 @@ mode = "dbpsk"
 differential = true
 
 [downlink.framer]
-kind = "syncword"
-syncword = "11111110000111011110010110010010000001000100110001011101011011000"
+kind = "ao40"
 threshold = 0
-payload_bits = 2566
 
 [downlink.fec]
 kind = "ao40"
@@ -674,16 +687,8 @@ warn_above = 8.4
             other => panic!("expected linear modem, got {other:?}"),
         }
         match &def.downlinks[0].framer {
-            Some(FramerDef::Syncword {
-                syncword,
-                threshold,
-                payload_bits,
-            }) => {
-                assert_eq!(syncword.len(), 65);
-                assert_eq!(*threshold, 0);
-                assert_eq!(*payload_bits, 2566);
-            }
-            other => panic!("expected syncword framer, got {other:?}"),
+            Some(FramerDef::Ao40 { threshold }) => assert_eq!(*threshold, 0),
+            other => panic!("expected AO-40 framer, got {other:?}"),
         }
         assert!(matches!(def.downlinks[0].fec, Some(FecDef::Ao40)));
         assert!(matches!(def.downlinks[0].codec, Some(CodecDef::Ao40Fec)));

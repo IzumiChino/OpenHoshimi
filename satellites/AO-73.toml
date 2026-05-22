@@ -34,10 +34,8 @@ mode = "dbpsk"
 differential = true
 
 [downlink.framer]
-kind = "syncword"
-syncword = "11111110000111011110010110010010000001000100110001011101011011000"
+kind = "ao40"
 threshold = 0
-payload_bits = 2566
 
 [downlink.fec]
 kind = "ao40"

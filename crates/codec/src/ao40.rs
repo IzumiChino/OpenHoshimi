@@ -6,13 +6,14 @@
 
 use openhoshimi_core::DecodeError;
 
-use crate::fec::{ccsds_randomizer, ReedSolomon};
+use crate::fec::{ccsds_randomizer, ReedSolomon, Viterbi};
 
 const AO40_PAYLOAD_LEN: usize = 256;
 const AO40_RS_CODEWORD_LEN: usize = 320;
 const AO40_INTERLEAVE: usize = 2;
 const AO40_POST_VITERBI_BITS: usize = 2566;
 const AO40_POST_VITERBI_BYTES: usize = 321;
+const AO40_VITERBI_SYMBOLS: usize = AO40_POST_VITERBI_BITS * 2;
 const AO40_SYNCWORD: &str = "11111110000111011110010110010010000001000100110001011101011011000";
 
 /// Decoder for AO-40 FEC post-Viterbi data.
@@ -62,6 +63,21 @@ impl Ao40FecDecoder {
         }
         let packed = pack_msb_bits(&bits[..AO40_POST_VITERBI_BITS]);
         self.decode_post_viterbi_bytes(&packed)
+    }
+
+    /// Decode AO-40 data after distributed-sync framing.
+    ///
+    /// The input is the data symbols recovered from the 5200-bit
+    /// transmitted block after removing the distributed sync vector and
+    /// deinterleaving. Any trailing filler symbols are ignored before
+    /// Viterbi decoding.
+    pub fn decode_channel_bits(&self, bits: &[u8]) -> Result<Ao40Frame, DecodeError> {
+        if bits.len() < AO40_VITERBI_SYMBOLS {
+            return Err(DecodeError::TooShort(bits.len() / 8));
+        }
+
+        let decoded = Viterbi::new().decode_bits(&bits[..AO40_VITERBI_SYMBOLS])?;
+        self.decode_post_viterbi_bits(&decoded)
     }
 }
 
@@ -143,6 +159,26 @@ mod tests {
         let frame = match decoder.decode_post_viterbi_bits(&bits[..AO40_POST_VITERBI_BITS]) {
             Ok(frame) => frame,
             Err(err) => panic!("valid AO-40 post-Viterbi bits: {err}"),
+        };
+
+        assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn decodes_channel_bits() {
+        let payload: Vec<u8> = (0..=255).collect();
+        let mut codeword = reed_solomon::encode_shortened(&payload, AO40_INTERLEAVE);
+        ccsds_randomizer::xor_sequence(&mut codeword);
+        let mut post_viterbi = codeword;
+        post_viterbi.push(0);
+        let bits = unpack_msb_bits(&post_viterbi);
+        let mut symbols = crate::fec::viterbi::encode_bits(&bits[..AO40_POST_VITERBI_BITS]);
+        symbols.push(0);
+
+        let decoder = Ao40FecDecoder::new();
+        let frame = match decoder.decode_channel_bits(&symbols) {
+            Ok(frame) => frame,
+            Err(err) => panic!("valid AO-40 channel bits: {err}"),
         };
 
         assert_eq!(frame.payload, payload);
