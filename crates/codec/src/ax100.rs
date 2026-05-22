@@ -239,9 +239,10 @@ mod tests {
         packet[4] ^= 0x20;
 
         let decoder = Ax100Decoder::new();
-        let err = decoder
-            .decode_reed_solomon(&packet)
-            .expect_err("damaged AX100 packet");
+        let err = match decoder.decode_reed_solomon(&packet) {
+            Ok(_) => panic!("damaged AX100 packet should fail"),
+            Err(err) => err,
+        };
 
         assert!(matches!(err, DecodeError::CrcMismatch));
     }

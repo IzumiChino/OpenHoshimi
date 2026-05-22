@@ -191,7 +191,10 @@ pub(crate) mod golay {
         fn rejects_uncorrectable_word() {
             let encoded = encode(0x2a5);
             let damaged = encoded ^ 0x00f0_f00f;
-            let err = decode(damaged).expect_err("uncorrectable Golay word");
+            let err = match decode(damaged) {
+                Ok(_) => panic!("uncorrectable Golay word should fail"),
+                Err(err) => err,
+            };
 
             assert!(matches!(err, DecodeError::InvalidEncoding(_)));
         }
@@ -412,7 +415,10 @@ pub(crate) mod reed_solomon {
             let mut encoded = encode_shortened(&message, 1);
             encoded[3] ^= 0x55;
 
-            let err = decode_shortened(&encoded, 1).expect_err("damaged RS codeword");
+            let err = match decode_shortened(&encoded, 1) {
+                Ok(_) => panic!("damaged RS codeword should fail"),
+                Err(err) => err,
+            };
 
             assert!(matches!(err, DecodeError::CrcMismatch));
         }

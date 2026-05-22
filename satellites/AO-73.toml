@@ -12,8 +12,8 @@
 #
 # Telemetry field offsets below cover a representative subset of the
 # 256-byte FUNcube payload - not the full set. They are sufficient to
-# exercise the schema; the full RT/WO/HR layout will be filled in once
-# the Phase 3 telemetry parser lands.
+# exercise the schema; the full RT/WO/HR layout will be filled in with the
+# telemetry parser.
 
 [satellite]
 name = "AO-73"
@@ -27,6 +27,23 @@ modulation = "DBPSK"
 baudrate = 1200
 framing = "AO40_FEC"
 telemetry_schema = "funcube_1"
+
+[downlink.modem]
+kind = "linear"
+mode = "dbpsk"
+differential = true
+
+[downlink.framer]
+kind = "syncword"
+syncword = "11111110000111011110010110010010000001000100110001011101011011000"
+threshold = 0
+payload_bits = 2566
+
+[downlink.fec]
+kind = "ao40"
+
+[downlink.codec]
+kind = "ao40_fec"
 
 [telemetry.funcube_1]
 

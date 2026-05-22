@@ -35,6 +35,16 @@ baudrate = 1200
 framing = "UNKNOWN"
 telemetry_schema = "hades_r"
 
+[downlink.modem]
+kind = "cpm"
+mode = "fsk"
+modulation_index = 1.0
+differential = false
+invert = false
+
+[downlink.codec]
+kind = "unknown"
+
 [[downlink]]
 label = "CW beacon"
 freq_hz = 436_885_000
@@ -44,9 +54,8 @@ framing = "UNKNOWN"
 
 [telemetry.hades_r]
 
-# Placeholder telemetry layout. AMSAT-EA's full HADES-R frame format
-# will be wired in once the Phase 3 telemetry parser and the AMSAT-EA
-# framing decoder are implemented.
+# Placeholder telemetry layout. AMSAT-EA's full HADES-R frame format will
+# be wired in with the telemetry parser and the AMSAT-EA framing decoder.
 
 [[telemetry.hades_r.field]]
 name = "bat_voltage"

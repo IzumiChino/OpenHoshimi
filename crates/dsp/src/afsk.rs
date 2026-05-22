@@ -8,7 +8,7 @@
 
 use std::f32::consts::TAU;
 
-use openhoshimi_core::Demodulator;
+use openhoshimi_core::{DecodeError, Demodulator};
 
 const MARK_HZ: f32 = 1200.0;
 const SPACE_HZ: f32 = 2200.0;
@@ -21,6 +21,7 @@ const BAUDRATE: u32 = 1200;
 /// fed arbitrary chunk sizes.
 pub struct AfskDemodulator {
     sample_rate: u32,
+    baudrate: u32,
     sample_phase: f32,
     samples_per_symbol: f32,
     mark: ToneDetector,
@@ -30,13 +31,49 @@ pub struct AfskDemodulator {
 impl AfskDemodulator {
     /// Create a Bell 202 demodulator for `sample_rate` Hz audio.
     pub fn new(sample_rate: u32) -> Self {
-        let samples_per_symbol = sample_rate as f32 / BAUDRATE as f32;
+        Self::from_params(sample_rate, MARK_HZ, SPACE_HZ, BAUDRATE)
+    }
+
+    /// Create an AFSK demodulator with explicit tones and baudrate.
+    pub fn with_tones(
+        sample_rate: u32,
+        mark_hz: f32,
+        space_hz: f32,
+        baudrate: u32,
+    ) -> Result<Self, DecodeError> {
+        if sample_rate == 0 {
+            return Err(DecodeError::InvalidEncoding(
+                "AFSK sample rate must be greater than zero".to_string(),
+            ));
+        }
+        if baudrate == 0 {
+            return Err(DecodeError::InvalidEncoding(
+                "AFSK baudrate must be greater than zero".to_string(),
+            ));
+        }
+        if mark_hz <= 0.0 {
+            return Err(DecodeError::InvalidEncoding(
+                "AFSK mark frequency must be greater than zero".to_string(),
+            ));
+        }
+        if space_hz <= 0.0 {
+            return Err(DecodeError::InvalidEncoding(
+                "AFSK space frequency must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(Self::from_params(sample_rate, mark_hz, space_hz, baudrate))
+    }
+
+    fn from_params(sample_rate: u32, mark_hz: f32, space_hz: f32, baudrate: u32) -> Self {
+        let samples_per_symbol = sample_rate as f32 / baudrate as f32;
         Self {
             sample_rate,
+            baudrate,
             sample_phase: 0.0,
             samples_per_symbol,
-            mark: ToneDetector::new(MARK_HZ, sample_rate),
-            space: ToneDetector::new(SPACE_HZ, sample_rate),
+            mark: ToneDetector::new(mark_hz, sample_rate),
+            space: ToneDetector::new(space_hz, sample_rate),
         }
     }
 }
@@ -70,7 +107,7 @@ impl Demodulator for AfskDemodulator {
     }
 
     fn baudrate(&self) -> u32 {
-        BAUDRATE
+        self.baudrate
     }
 }
 
@@ -153,5 +190,15 @@ mod tests {
         let demodulator = AfskDemodulator::new(48_000);
         assert_eq!(demodulator.sample_rate(), 48_000);
         assert_eq!(demodulator.baudrate(), 1200);
+    }
+
+    #[test]
+    fn rejects_invalid_custom_tones() {
+        let err = match AfskDemodulator::with_tones(48_000, 0.0, SPACE_HZ, BAUDRATE) {
+            Ok(_) => panic!("invalid mark tone should fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, DecodeError::InvalidEncoding(_)));
     }
 }

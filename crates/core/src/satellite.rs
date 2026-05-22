@@ -98,6 +98,194 @@ pub struct DownlinkDef {
     /// Optional - some downlinks (e.g. voice repeaters) carry no telemetry.
     #[serde(default)]
     pub telemetry_schema: Option<String>,
+    /// Structured modem configuration for this downlink.
+    #[serde(default)]
+    pub modem: Option<ModemDef>,
+    /// Optional line coding transform after demodulation.
+    #[serde(default)]
+    pub line_coding: Option<LineCodingDef>,
+    /// Optional bit descrambler after line decoding.
+    #[serde(default)]
+    pub descrambler: Option<DescramblerDef>,
+    /// Structured framer configuration.
+    #[serde(default)]
+    pub framer: Option<FramerDef>,
+    /// Optional forward-error-correction stage.
+    #[serde(default)]
+    pub fec: Option<FecDef>,
+    /// Structured frame decoder configuration.
+    #[serde(default)]
+    pub codec: Option<CodecDef>,
+}
+
+/// Modem configuration for a downlink.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModemDef {
+    /// Bell 202 audio AFSK.
+    Afsk {
+        /// Mark tone frequency in Hz.
+        #[serde(default = "default_afsk_mark_hz")]
+        mark_hz: f32,
+        /// Space tone frequency in Hz.
+        #[serde(default = "default_afsk_space_hz")]
+        space_hz: f32,
+    },
+    /// Binary continuous-phase modulation over IQ.
+    Cpm {
+        /// CPM family mode.
+        mode: CpmModeDef,
+        /// Modulation index.
+        #[serde(default)]
+        modulation_index: Option<f32>,
+        /// Gaussian BT product for GFSK/GMSK.
+        #[serde(default)]
+        gaussian_bt: Option<f32>,
+        /// Decode differential encoding after hard slicing.
+        #[serde(default)]
+        differential: bool,
+        /// Invert hard symbol decisions.
+        #[serde(default)]
+        invert: bool,
+    },
+    /// Linear phase modulation over IQ.
+    Linear {
+        /// Linear modulation mode.
+        mode: LinearModeDef,
+        /// Decode differential encoding after hard slicing.
+        #[serde(default)]
+        differential: bool,
+        /// Invert hard symbol decisions.
+        #[serde(default)]
+        invert: bool,
+    },
+    /// LoRa modem placeholder.
+    Lora {
+        /// LoRa spreading factor.
+        spreading_factor: u8,
+        /// LoRa bandwidth in Hz.
+        bandwidth_hz: u32,
+    },
+    /// Four-level FSK modem placeholder.
+    FourFsk {
+        /// Frequency offsets for the four symbols, in Hz.
+        freq_offsets_hz: [f32; 4],
+    },
+}
+
+/// CPM modulation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpmModeDef {
+    /// Binary FSK.
+    Fsk,
+    /// Minimum-shift keying.
+    Msk,
+    /// Gaussian FSK.
+    Gfsk,
+    /// Gaussian MSK.
+    Gmsk,
+}
+
+/// Linear modulation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinearModeDef {
+    /// Binary PSK.
+    Bpsk,
+    /// Differential binary PSK.
+    Dbpsk,
+    /// Quadrature PSK.
+    Qpsk,
+    /// Offset quadrature PSK.
+    Oqpsk,
+}
+
+/// Line coding transform configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LineCodingDef {
+    /// NRZI line coding.
+    Nrzi,
+    /// NRZ-S line coding placeholder.
+    Nrzs,
+    /// NRZ-M line coding placeholder.
+    Nrzm,
+}
+
+/// Descrambler configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DescramblerDef {
+    /// G3RUH self-synchronising descrambler.
+    G3ruh,
+    /// CCSDS randomizer descrambler.
+    Ccsds,
+}
+
+/// Framer configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FramerDef {
+    /// HDLC flag-based framing.
+    Hdlc,
+    /// Fixed syncword followed by a fixed-size payload.
+    Syncword {
+        /// Syncword bits as ASCII `0` and `1` characters.
+        syncword: String,
+        /// Maximum number of bit errors allowed in the syncword.
+        #[serde(default)]
+        threshold: usize,
+        /// Number of payload bits to collect after syncword detection.
+        payload_bits: usize,
+    },
+}
+
+/// Forward-error-correction stage configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FecDef {
+    /// Reed-Solomon codeword decoder.
+    ReedSolomon {
+        /// Interleave factor.
+        #[serde(default = "default_interleave")]
+        interleave: usize,
+    },
+    /// AO-40 FEC decoder placeholder for the full chain.
+    Ao40,
+    /// GOMspace AX100 FEC wrapper.
+    Ax100,
+}
+
+/// Frame decoder configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodecDef {
+    /// AX.25 frame decoder.
+    Ax25,
+    /// AO-40 FEC payload decoder.
+    Ao40Fec,
+    /// GOMspace AX100 decoder.
+    GomspaceAx100 {
+        /// AX100 decoder mode.
+        mode: Ax100ModeDef,
+    },
+    /// CCSDS frame decoder placeholder.
+    Ccsds,
+    /// FX.25 frame decoder placeholder.
+    Fx25,
+    /// Unknown or unsupported frame decoder.
+    Unknown,
+}
+
+/// GOMspace AX100 decoder mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ax100ModeDef {
+    /// AX100 Reed-Solomon mode.
+    ReedSolomon,
+    /// AX100 ASM and Golay mode.
+    AsmGolay,
 }
 
 /// A telemetry schema: the layout of fields inside a frame's payload.
@@ -163,6 +351,18 @@ fn default_endian() -> Endian {
 
 fn default_scale() -> f64 {
     1.0
+}
+
+fn default_afsk_mark_hz() -> f32 {
+    1200.0
+}
+
+fn default_afsk_space_hz() -> f32 {
+    2200.0
+}
+
+fn default_interleave() -> usize {
+    1
 }
 
 fn required<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -240,8 +440,133 @@ fn validate(def: &SatelliteDefinition) -> Result<(), ConfigError> {
                 });
             }
         }
+        validate_downlink_pipeline(d)?;
     }
     Ok(())
+}
+
+fn validate_downlink_pipeline(d: &DownlinkDef) -> Result<(), ConfigError> {
+    if let Some(modem) = &d.modem {
+        validate_modem(&d.label, modem)?;
+    }
+    if let Some(framer) = &d.framer {
+        validate_framer(&d.label, framer)?;
+    }
+    if let Some(fec) = &d.fec {
+        validate_fec(&d.label, fec)?;
+    }
+    Ok(())
+}
+
+fn validate_modem(label: &str, modem: &ModemDef) -> Result<(), ConfigError> {
+    match modem {
+        ModemDef::Afsk { mark_hz, space_hz } => {
+            if *mark_hz <= 0.0 {
+                return invalid_value(format!("downlink[{label}].modem.mark_hz"), "must be > 0");
+            }
+            if *space_hz <= 0.0 {
+                return invalid_value(format!("downlink[{label}].modem.space_hz"), "must be > 0");
+            }
+        }
+        ModemDef::Cpm {
+            modulation_index,
+            gaussian_bt,
+            ..
+        } => {
+            if modulation_index.is_some_and(|value| value <= 0.0) {
+                return invalid_value(
+                    format!("downlink[{label}].modem.modulation_index"),
+                    "must be > 0",
+                );
+            }
+            if gaussian_bt.is_some_and(|value| value <= 0.0) {
+                return invalid_value(
+                    format!("downlink[{label}].modem.gaussian_bt"),
+                    "must be > 0",
+                );
+            }
+        }
+        ModemDef::Linear { .. } => {}
+        ModemDef::Lora {
+            spreading_factor,
+            bandwidth_hz,
+        } => {
+            if !(6..=12).contains(spreading_factor) {
+                return invalid_value(
+                    format!("downlink[{label}].modem.spreading_factor"),
+                    "must be between 6 and 12",
+                );
+            }
+            if *bandwidth_hz == 0 {
+                return invalid_value(
+                    format!("downlink[{label}].modem.bandwidth_hz"),
+                    "must be > 0",
+                );
+            }
+        }
+        ModemDef::FourFsk { freq_offsets_hz } => {
+            if !freq_offsets_hz.iter().all(|value| value.is_finite()) {
+                return invalid_value(
+                    format!("downlink[{label}].modem.freq_offsets_hz"),
+                    "all offsets must be finite",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_framer(label: &str, framer: &FramerDef) -> Result<(), ConfigError> {
+    match framer {
+        FramerDef::Hdlc => {}
+        FramerDef::Syncword {
+            syncword,
+            threshold,
+            payload_bits,
+        } => {
+            if syncword.is_empty() || !syncword.bytes().all(|byte| matches!(byte, b'0' | b'1')) {
+                return invalid_value(
+                    format!("downlink[{label}].framer.syncword"),
+                    "must contain only 0 and 1 characters",
+                );
+            }
+            if *threshold > syncword.len() {
+                return invalid_value(
+                    format!("downlink[{label}].framer.threshold"),
+                    "must be <= syncword length",
+                );
+            }
+            if *payload_bits == 0 {
+                return invalid_value(
+                    format!("downlink[{label}].framer.payload_bits"),
+                    "must be > 0",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_fec(label: &str, fec: &FecDef) -> Result<(), ConfigError> {
+    match fec {
+        FecDef::ReedSolomon { interleave } => {
+            if *interleave == 0 {
+                return invalid_value(format!("downlink[{label}].fec.interleave"), "must be > 0");
+            }
+        }
+        FecDef::Ao40 | FecDef::Ax100 => {}
+    }
+
+    Ok(())
+}
+
+fn invalid_value<T>(field: String, reason: &'static str) -> Result<T, ConfigError> {
+    Err(ConfigError::InvalidValue {
+        field,
+        reason: reason.to_string(),
+    })
 }
 
 fn translate_toml_error(err: toml::de::Error) -> ConfigError {
@@ -295,6 +620,23 @@ baudrate = 1200
 framing = "AO40_FEC"
 telemetry_schema = "funcube_1"
 
+[downlink.modem]
+kind = "linear"
+mode = "dbpsk"
+differential = true
+
+[downlink.framer]
+kind = "syncword"
+syncword = "11111110000111011110010110010010000001000100110001011101011011000"
+threshold = 0
+payload_bits = 2566
+
+[downlink.fec]
+kind = "ao40"
+
+[downlink.codec]
+kind = "ao40_fec"
+
 [telemetry.funcube_1]
 
 [[telemetry.funcube_1.field]]
@@ -319,6 +661,32 @@ warn_above = 8.4
         assert_eq!(def.satellite.norad_id, 39444);
         assert_eq!(def.downlinks.len(), 1);
         assert_eq!(def.downlinks[0].baudrate, 1200);
+        match &def.downlinks[0].modem {
+            Some(ModemDef::Linear {
+                mode,
+                differential,
+                invert,
+            }) => {
+                assert_eq!(*mode, LinearModeDef::Dbpsk);
+                assert!(*differential);
+                assert!(!*invert);
+            }
+            other => panic!("expected linear modem, got {other:?}"),
+        }
+        match &def.downlinks[0].framer {
+            Some(FramerDef::Syncword {
+                syncword,
+                threshold,
+                payload_bits,
+            }) => {
+                assert_eq!(syncword.len(), 65);
+                assert_eq!(*threshold, 0);
+                assert_eq!(*payload_bits, 2566);
+            }
+            other => panic!("expected syncword framer, got {other:?}"),
+        }
+        assert!(matches!(def.downlinks[0].fec, Some(FecDef::Ao40)));
+        assert!(matches!(def.downlinks[0].codec, Some(CodecDef::Ao40Fec)));
         let schema = match def.telemetry.get("funcube_1") {
             Some(schema) => schema,
             None => panic!("schema present"),
@@ -350,6 +718,40 @@ framing = "AX25"
         match err {
             ConfigError::MissingField(name) => assert_eq!(name, "norad_id"),
             other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_syncword_is_reported() {
+        let bad = r#"
+[satellite]
+name = "X"
+norad_id = 1
+
+[[downlink]]
+label = "x"
+freq_hz = 1
+modulation = "FSK"
+baudrate = 1200
+framing = "UNKNOWN"
+
+[downlink.framer]
+kind = "syncword"
+syncword = "10x1"
+payload_bits = 8
+"#;
+        let path = write_temp("invalid-syncword.toml", bad);
+        let err = match load_satellite(&path) {
+            Ok(_) => panic!("should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            ConfigError::InvalidValue { field, reason } => {
+                assert_eq!(field, "downlink[x].framer.syncword");
+                assert_eq!(reason, "must contain only 0 and 1 characters");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
