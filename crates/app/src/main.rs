@@ -16,14 +16,17 @@ use eframe::egui::{
     ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextureOptions, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-use openhoshimi_core::satellite::{load_all_satellites, DownlinkDef, SatelliteDefinition};
+use openhoshimi_core::satellite::{
+    load_all_satellites, DownlinkDef, ModemDef, SatelliteDefinition,
+};
 use openhoshimi_core::{
     Frame as CoreFrame, InputSource, IoError, IqSample, IqSource, TelemetryField, TelemetryValue,
 };
 use openhoshimi_io::{OggSource, SoundcardSource, WavIqSource, WavSource};
 use openhoshimi_runtime::pipeline::{
-    can_build_downlink, format_hex, format_timestamp, infer_tuning_offset_hz, input_kind_for,
-    is_ao40_fec_downlink, is_linear_iq_modem, prepare_linear_iq_setup_scored,
+    can_build_downlink, estimate_cpm_iq_frequency_offset_hz, estimate_iq_frequency_offset_hz,
+    format_hex, format_timestamp, infer_tuning_offset_hz, input_kind_for, is_ao40_fec_downlink,
+    is_linear_iq_modem, prepare_linear_iq_setup_scored,
     prepare_linear_iq_setup_scored_with_progress, BitPipeline, DecodedFrame, InputKind,
     SoftAo40Pipeline,
 };
@@ -643,9 +646,23 @@ impl eframe::App for OpenHoshimiApp {
             .frame(panel_frame(Palette::BAR))
             .show(ctx, |ui| self.status_bar(ui));
 
+        egui::SidePanel::left("satellites_panel")
+            .exact_width(160.0)
+            .resizable(false)
+            .frame(Frame::new().fill(Palette::BG))
+            .show_separator_line(true)
+            .show(ctx, |ui| self.left_satellites(ui));
+
+        egui::SidePanel::right("right_panel_side")
+            .exact_width(220.0)
+            .resizable(false)
+            .frame(Frame::new().fill(Palette::BG))
+            .show_separator_line(true)
+            .show(ctx, |ui| self.right_panel(ui));
+
         egui::CentralPanel::default()
             .frame(Frame::new().fill(Palette::BG))
-            .show(ctx, |ui| self.main_area(ui));
+            .show(ctx, |ui| self.center_workspace(ui));
 
         self.alignment_modal(ctx);
     }
@@ -942,31 +959,6 @@ impl OpenHoshimiApp {
     fn current_progress(&self) -> Option<(u64, u64)> {
         self.input_progress_total
             .map(|total| (self.input_progress_processed, total))
-    }
-
-    fn main_area(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.set_height(ui.available_height());
-            ui.allocate_ui_with_layout(
-                Vec2::new(160.0, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| self.left_satellites(ui),
-            );
-            vline(ui);
-            let right_width = 220.0;
-            let center_width = (ui.available_width() - right_width - 2.0).max(320.0);
-            ui.allocate_ui_with_layout(
-                Vec2::new(center_width, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| self.center_workspace(ui),
-            );
-            vline(ui);
-            ui.allocate_ui_with_layout(
-                Vec2::new(right_width, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| self.right_panel(ui),
-            );
-        });
     }
 
     fn left_satellites(&mut self, ui: &mut egui::Ui) {
@@ -1744,6 +1736,12 @@ fn run_decode_thread(
                 if !pending.is_empty() {
                     let take = pending.len().min(READ_CHUNK);
                     let samples: Vec<IqSample> = pending.drain(..take).collect();
+                    spectrum_stride += 1;
+                    if spectrum_stride % 4 == 0 {
+                        let _ = events.send(RxEvent::Samples(SpectrumSamples::Iq(
+                            samples[..samples.len().min(SPECTRUM_WINDOW)].to_vec(),
+                        )));
+                    }
                     let frames = pipeline.push_samples(&samples);
                     emit_frames(
                         &events,
@@ -1811,6 +1809,12 @@ fn run_decode_thread(
                 if !pending.is_empty() {
                     let take = pending.len().min(READ_CHUNK);
                     let samples: Vec<IqSample> = pending.drain(..take).collect();
+                    spectrum_stride += 1;
+                    if spectrum_stride % 4 == 0 {
+                        let _ = events.send(RxEvent::Samples(SpectrumSamples::Iq(
+                            samples[..samples.len().min(SPECTRUM_WINDOW)].to_vec(),
+                        )));
+                    }
                     let decoded = pipeline.push_samples(&samples);
                     emit_decoded_frames(
                         &events,
@@ -2018,12 +2022,24 @@ fn build_runtime_input(
                             && cached.downlink_id == downlink_id
                     });
                     let (setup, prefix) = if let Some(cached) = cache_hit {
-                        let prefix_len = sample_rate as usize * 8;
-                        let _ = read_iq_prefix(&mut source, prefix_len)?;
-                        let _ = events.send(RxEvent::Dropped(format!(
-                            "IQ alignment (cached): tuning={:.1} Hz skip={} prefix_frames={}",
-                            cached.setup.tuning_offset_hz, cached.setup.sample_skip, cached.frames
-                        )));
+                        if cached.prefix.is_empty() && cached.setup.sample_skip == 0 {
+                            // Non-linear-IQ short-circuit from run_alignment_thread:
+                            // skip the 8 s prefix read entirely so the decoder
+                            // sees the file from sample 0.
+                            let _ = events.send(RxEvent::Dropped(format!(
+                                "IQ alignment (non-linear): tuning={:.1} Hz",
+                                cached.setup.tuning_offset_hz
+                            )));
+                        } else {
+                            let prefix_len = sample_rate as usize * 8;
+                            let _ = read_iq_prefix(&mut source, prefix_len)?;
+                            let _ = events.send(RxEvent::Dropped(format!(
+                                "IQ alignment (cached): tuning={:.1} Hz skip={} prefix_frames={}",
+                                cached.setup.tuning_offset_hz,
+                                cached.setup.sample_skip,
+                                cached.frames
+                            )));
+                        }
                         (cached.setup.clone(), cached.prefix.clone())
                     } else {
                         let prefix_len = sample_rate as usize * 8;
@@ -2125,19 +2141,41 @@ fn run_alignment_thread(
     let sample_rate = source.sample_rate();
 
     // Non-linear modems (CPM/GMSK, AFSK, 4FSK, FM-audio) don't have a
-    // linear-IQ alignment grid — fall straight through to TOML defaults
-    // without reading the 8-second prefix or running the scorer.
+    // linear-IQ alignment grid. We still read the 8-second prefix so we
+    // can FFT-estimate the CPM carrier offset (this is what decode_file
+    // does on the same non-linear path); the prefix is then handed to
+    // the decoder via the cached alignment so no samples are lost.
     if !is_linear_iq_modem(&downlink) {
+        let prefix_len = sample_rate as usize * 8;
+        let prefix = match read_iq_prefix(&mut source, prefix_len) {
+            Ok(prefix) => prefix,
+            Err(err) => {
+                let _ = events.send(RxEvent::AlignmentFailed(err));
+                return;
+            }
+        };
+        let mut tuning = tuning_offset_hz;
+        if matches!(downlink.modem, Some(ModemDef::Cpm { .. })) {
+            let estimate = estimate_cpm_iq_frequency_offset_hz(&prefix, sample_rate)
+                .or_else(|| estimate_iq_frequency_offset_hz(&prefix, sample_rate))
+                .filter(|v| v.is_finite());
+            if let Some(estimate) = estimate {
+                let _ = events.send(RxEvent::Dropped(format!(
+                    "CPM carrier estimate: {estimate:.1} Hz (filename hint: {tuning:.1} Hz)"
+                )));
+                tuning = estimate;
+            }
+        }
         let setup = openhoshimi_runtime::pipeline::LinearIqSetup {
             downlink: downlink.clone(),
-            tuning_offset_hz,
+            tuning_offset_hz: tuning,
             sample_skip: 0,
         };
         let cached = CachedAlignment {
             path,
             sample_rate,
             downlink_id,
-            prefix: Vec::new(),
+            prefix,
             setup,
             frames: 0,
         };
@@ -2456,12 +2494,6 @@ fn row_rect(ui: &mut egui::Ui, height: f32) -> Rect {
 
 fn hline(ui: &mut egui::Ui) {
     let rect = row_rect(ui, 1.0);
-    ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, Palette::LINE);
-}
-
-fn vline(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, ui.available_height()), Sense::hover());
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, Palette::LINE);
 }
