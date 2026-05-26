@@ -40,6 +40,7 @@ clap = { version = "4", features = ["derive"] }
 eframe = "0.31"
 egui_extras = "0.31"
 rfd = "0.14.1"
+rustfft = "6.4"
 
 [profile.release]
 lto = "thin"

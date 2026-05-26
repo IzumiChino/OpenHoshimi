@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,13 +33,18 @@ use openhoshimi_runtime::pipeline::{
 };
 use openhoshimi_telemetry::SchemaParser;
 use rfd::FileDialog;
+use rustfft::num_complex::Complex32;
+use rustfft::{Fft, FftPlanner};
 
 const READ_CHUNK: usize = 4096;
 const MAX_FRAMES: usize = 512;
 const MAX_WATERFALL_ROWS: usize = 256;
 const MAX_DIAGNOSTICS: usize = 24;
 const SPECTRUM_BINS: usize = 1024;
-const SPECTRUM_WINDOW: usize = 2048;
+const SPECTRUM_FFT_LEN: usize = 4096;
+const SPECTRUM_INTERVAL: Duration = Duration::from_millis(33);
+const RX_EVENT_QUEUE: usize = 1024;
+const WATERFALL_HEIGHT_PX: f32 = 220.0;
 const DEFAULT_WATERFALL_MIN_DB: f32 = -90.0;
 const DEFAULT_WATERFALL_MAX_DB: f32 = -10.0;
 const WATERFALL_DB_FLOOR: f32 = -160.0;
@@ -79,14 +85,14 @@ struct OpenHoshimiApp {
     frames_seen: usize,
     diagnostics: VecDeque<DiagnosticEntry>,
     waterfall: VecDeque<Vec<f32>>,
-    hann_window: Vec<f32>,
+    spectrum: SpectrumProcessor,
     waterfall_texture: Option<egui::TextureHandle>,
     waterfall_min_db: f32,
     waterfall_max_db: f32,
     rx_thread: Option<thread::JoinHandle<()>>,
     rx_stop: Option<Sender<()>>,
     rx_events: Receiver<RxEvent>,
-    rx_sender: Sender<RxEvent>,
+    rx_sender: SyncSender<RxEvent>,
     startup_wav: Option<PathBuf>,
     last_export_status: Option<String>,
     alignment_state: AlignmentState,
@@ -194,7 +200,7 @@ impl OpenHoshimiApp {
 
         let satellites_dir = resolve_satellites_dir();
         let startup_wav = std::env::var_os("OPENHOSHIMI_OPEN_WAV").map(PathBuf::from);
-        let (rx_sender, rx_events) = mpsc::channel();
+        let (rx_sender, rx_events) = mpsc::sync_channel(RX_EVENT_QUEUE);
         let mut app = Self {
             satellites_dir,
             satellites: Vec::new(),
@@ -219,7 +225,7 @@ impl OpenHoshimiApp {
             frames_seen: 0,
             diagnostics: VecDeque::new(),
             waterfall: VecDeque::new(),
-            hann_window: build_hann_window(SPECTRUM_WINDOW),
+            spectrum: SpectrumProcessor::new(SPECTRUM_FFT_LEN),
             waterfall_texture: None,
             waterfall_min_db: DEFAULT_WATERFALL_MIN_DB,
             waterfall_max_db: DEFAULT_WATERFALL_MAX_DB,
@@ -486,20 +492,14 @@ impl OpenHoshimiApp {
     fn push_waterfall_row(&mut self, samples: SpectrumSamples) {
         let span_hz = self.spectrum_span_hz();
         let row = match samples {
-            SpectrumSamples::Audio(samples) => spectrum_row_audio(
-                &samples,
-                SPECTRUM_BINS,
-                self.input_rate,
-                span_hz,
-                &self.hann_window,
-            ),
-            SpectrumSamples::Iq(samples) => spectrum_row_iq(
-                &samples,
-                SPECTRUM_BINS,
-                self.input_rate,
-                span_hz,
-                &self.hann_window,
-            ),
+            SpectrumSamples::Audio(samples) => {
+                self.spectrum
+                    .row_audio(&samples, SPECTRUM_BINS, self.input_rate, span_hz)
+            }
+            SpectrumSamples::Iq(samples) => {
+                self.spectrum
+                    .row_iq(&samples, SPECTRUM_BINS, self.input_rate, span_hz)
+            }
         };
         self.waterfall.push_back(row);
         while self.waterfall.len() > MAX_WATERFALL_ROWS {
@@ -1097,7 +1097,7 @@ impl OpenHoshimiApp {
         if self.waterfall_max_db <= self.waterfall_min_db + 1.0 {
             self.waterfall_max_db = (self.waterfall_min_db + 1.0).min(WATERFALL_DB_CEIL);
         }
-        let desired = Vec2::new(ui.available_width(), 160.0);
+        let desired = Vec2::new(ui.available_width(), WATERFALL_HEIGHT_PX);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
@@ -1338,15 +1338,32 @@ impl OpenHoshimiApp {
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
-        let input_height = 116.0;
-        let diagnostics_height = 112.0;
-        let telemetry_height =
-            (ui.available_height() - input_height - diagnostics_height).max(180.0);
-        ui.allocate_ui(Vec2::new(ui.available_width(), telemetry_height), |ui| {
-            self.telemetry(ui)
-        });
-        self.input_panel(ui);
-        self.diagnostics_panel(ui);
+        // Anchor diagnostics + input to the bottom so they always stay
+        // visible. Both are user-resizable: dragging the splitter lets the
+        // user trade telemetry rows for more diagnostics or input detail.
+        // Telemetry takes whatever vertical space is left and scrolls
+        // inside its own ScrollArea.
+        egui::TopBottomPanel::bottom("right_diag_section")
+            .resizable(true)
+            .default_height(140.0)
+            .min_height(60.0)
+            .max_height((ui.available_height() * 0.6).max(80.0))
+            .frame(Frame::new().fill(Palette::BG))
+            .show_separator_line(true)
+            .show_inside(ui, |ui| self.diagnostics_panel(ui));
+
+        egui::TopBottomPanel::bottom("right_input_section")
+            .resizable(true)
+            .default_height(180.0)
+            .min_height(80.0)
+            .max_height((ui.available_height() * 0.6).max(120.0))
+            .frame(Frame::new().fill(Palette::BG))
+            .show_separator_line(true)
+            .show_inside(ui, |ui| self.input_panel(ui));
+
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(Palette::BG))
+            .show_inside(ui, |ui| self.telemetry(ui));
     }
 
     fn telemetry(&mut self, ui: &mut egui::Ui) {
@@ -1358,7 +1375,6 @@ impl OpenHoshimiApp {
         ScrollArea::vertical()
             .id_salt("telemetry_scroll")
             .auto_shrink([false, false])
-            .max_height(ui.available_height())
             .show(ui, |ui| {
                 if let Some(row) = self.selected_frame_row() {
                     let mut groups: BTreeMap<&str, Vec<&TelemetryField>> = BTreeMap::new();
@@ -1387,34 +1403,43 @@ impl OpenHoshimiApp {
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 group_header(ui, "Input");
-                key_value(ui, "source", self.input_source_label());
-                key_value(ui, "device", &self.source_description);
-                key_value(ui, "rate", &format!("{} Hz", self.input_rate));
-                if let Some(path) = &self.input_path {
-                    key_value(ui, "file", &short_path_label(path));
-                }
-                if let Some(downlink) = self.selected_downlink() {
-                    key_value(
-                        ui,
-                        "modulation",
-                        &format!("{} {}bd", downlink.modulation, downlink.baudrate),
-                    );
-                    key_value(ui, "framing", &downlink.framing);
-                    key_value(ui, "input", input_kind_label(input_kind_for(downlink)));
-                }
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    label_muted(ui, "pace  ");
-                    let pace_enabled = matches!(self.input_mode, InputMode::WavFile);
-                    ui.add_enabled_ui(pace_enabled, |ui| {
-                        ui.selectable_value(&mut self.decode_pace, DecodePace::Fast, "[Fast]");
-                        ui.selectable_value(
-                            &mut self.decode_pace,
-                            DecodePace::Realtime,
-                            "[Realtime]",
-                        );
+                ScrollArea::vertical()
+                    .id_salt("input_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        key_value(ui, "source", self.input_source_label());
+                        key_value(ui, "device", &self.source_description);
+                        key_value(ui, "rate", &format!("{} Hz", self.input_rate));
+                        if let Some(path) = &self.input_path {
+                            key_value(ui, "file", &short_path_label(path));
+                        }
+                        if let Some(downlink) = self.selected_downlink() {
+                            key_value(
+                                ui,
+                                "modulation",
+                                &format!("{} {}bd", downlink.modulation, downlink.baudrate),
+                            );
+                            key_value(ui, "framing", &downlink.framing);
+                            key_value(ui, "input", input_kind_label(input_kind_for(downlink)));
+                        }
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            label_muted(ui, "pace  ");
+                            let pace_enabled = matches!(self.input_mode, InputMode::WavFile);
+                            ui.add_enabled_ui(pace_enabled, |ui| {
+                                ui.selectable_value(
+                                    &mut self.decode_pace,
+                                    DecodePace::Fast,
+                                    "[Fast]",
+                                );
+                                ui.selectable_value(
+                                    &mut self.decode_pace,
+                                    DecodePace::Realtime,
+                                    "[Realtime]",
+                                );
+                            });
+                        });
                     });
-                });
             });
     }
 
@@ -1601,15 +1626,22 @@ impl OpenHoshimiApp {
 
     fn spectrum_span_hz(&self) -> u32 {
         if matches!(self.input_mode, InputMode::WavFile) {
-            (self.input_rate / 2).clamp(6_000, 48_000)
+            (self.input_rate / 2).max(6_000)
         } else {
             6_000
         }
     }
 
     fn spectrum_scale_label(&self) -> String {
-        let span = self.spectrum_span_hz() / 1000;
-        format!("-{span}k   -{}k   0   +{}k   +{span}k", span / 2, span / 2)
+        let span = self.spectrum_span_hz();
+        let mid = span / 2;
+        format!(
+            "-{}   -{}   0   +{}   +{}",
+            format_hz_short(span),
+            format_hz_short(mid),
+            format_hz_short(mid),
+            format_hz_short(span),
+        )
     }
 
     fn waterfall_texture_id(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
@@ -1635,6 +1667,32 @@ impl OpenHoshimiApp {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Emit a spectrum row, throttled to roughly `SPECTRUM_INTERVAL`.
+///
+/// Spectrum samples are best-effort: if the GUI thread is behind and the
+/// queue is full, we drop the row instead of blocking the decoder. The
+/// wall-clock gate also keeps the row rate flat across vastly different
+/// sample rates.
+fn try_emit_spectrum<F: FnOnce() -> SpectrumSamples>(
+    events: &SyncSender<RxEvent>,
+    last: &mut Option<Instant>,
+    build: F,
+) {
+    let now = Instant::now();
+    if let Some(prev) = *last {
+        if now.duration_since(prev) < SPECTRUM_INTERVAL {
+            return;
+        }
+    }
+    let samples = build();
+    match events.try_send(RxEvent::Samples(samples)) {
+        Ok(_) => *last = Some(now),
+        Err(TrySendError::Full(_)) => {}
+        Err(TrySendError::Disconnected(_)) => *last = Some(now),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_decode_thread(
     satellite: SatelliteDefinition,
     downlink: DownlinkDef,
@@ -1643,7 +1701,7 @@ fn run_decode_thread(
     input_path: Option<PathBuf>,
     tuning_offset_hz: f32,
     cached_alignment: Option<CachedAlignment>,
-    events: Sender<RxEvent>,
+    events: SyncSender<RxEvent>,
     stop: Receiver<()>,
 ) {
     let _ = events.send(RxEvent::Dropped("priming WAV input\u{2026}".to_string()));
@@ -1682,7 +1740,11 @@ fn run_decode_thread(
         matches!(input_mode, InputMode::WavFile) && matches!(decode_pace, DecodePace::Realtime);
     let start = Instant::now();
     let mut count = 0usize;
-    let mut spectrum_stride = 0usize;
+    // Spectrum rows are throttled by wall-clock so the rate is independent
+    // of sample_rate / READ_CHUNK. The earlier stride-based limiter caused
+    // wide bandwidth captures (e.g. 1.4 MS/s GMSK) to flood the GUI thread
+    // with FFT work; this keeps the row rate at ~30 Hz on every input.
+    let mut last_spectrum_at: Option<Instant> = None;
 
     loop {
         if stop.try_recv().is_ok() {
@@ -1702,12 +1764,9 @@ fn run_decode_thread(
                 if read == 0 {
                     continue;
                 }
-                spectrum_stride += 1;
-                if spectrum_stride % 4 == 0 {
-                    let _ = events.send(RxEvent::Samples(SpectrumSamples::Audio(
-                        samples[..read.min(SPECTRUM_WINDOW)].to_vec(),
-                    )));
-                }
+                try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                    SpectrumSamples::Audio(samples[..read.min(SPECTRUM_FFT_LEN)].to_vec())
+                });
                 let frames = pipeline.push_samples(&samples[..read]);
                 emit_frames(
                     &events,
@@ -1736,12 +1795,9 @@ fn run_decode_thread(
                 if !pending.is_empty() {
                     let take = pending.len().min(READ_CHUNK);
                     let samples: Vec<IqSample> = pending.drain(..take).collect();
-                    spectrum_stride += 1;
-                    if spectrum_stride % 4 == 0 {
-                        let _ = events.send(RxEvent::Samples(SpectrumSamples::Iq(
-                            samples[..samples.len().min(SPECTRUM_WINDOW)].to_vec(),
-                        )));
-                    }
+                    try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                        SpectrumSamples::Iq(samples[..samples.len().min(SPECTRUM_FFT_LEN)].to_vec())
+                    });
                     let frames = pipeline.push_samples(&samples);
                     emit_frames(
                         &events,
@@ -1775,12 +1831,9 @@ fn run_decode_thread(
                 if read == 0 {
                     continue;
                 }
-                spectrum_stride += 1;
-                if spectrum_stride % 4 == 0 {
-                    let _ = events.send(RxEvent::Samples(SpectrumSamples::Iq(
-                        samples[..read.min(SPECTRUM_WINDOW)].to_vec(),
-                    )));
-                }
+                try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                    SpectrumSamples::Iq(samples[..read.min(SPECTRUM_FFT_LEN)].to_vec())
+                });
                 let frames = pipeline.push_samples(&samples[..read]);
                 emit_frames(
                     &events,
@@ -1809,12 +1862,9 @@ fn run_decode_thread(
                 if !pending.is_empty() {
                     let take = pending.len().min(READ_CHUNK);
                     let samples: Vec<IqSample> = pending.drain(..take).collect();
-                    spectrum_stride += 1;
-                    if spectrum_stride % 4 == 0 {
-                        let _ = events.send(RxEvent::Samples(SpectrumSamples::Iq(
-                            samples[..samples.len().min(SPECTRUM_WINDOW)].to_vec(),
-                        )));
-                    }
+                    try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                        SpectrumSamples::Iq(samples[..samples.len().min(SPECTRUM_FFT_LEN)].to_vec())
+                    });
                     let decoded = pipeline.push_samples(&samples);
                     emit_decoded_frames(
                         &events,
@@ -1847,12 +1897,9 @@ fn run_decode_thread(
                 if read == 0 {
                     continue;
                 }
-                spectrum_stride += 1;
-                if spectrum_stride % 4 == 0 {
-                    let _ = events.send(RxEvent::Samples(SpectrumSamples::Iq(
-                        samples[..read.min(SPECTRUM_WINDOW)].to_vec(),
-                    )));
-                }
+                try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                    SpectrumSamples::Iq(samples[..read.min(SPECTRUM_FFT_LEN)].to_vec())
+                });
                 let decoded = pipeline.push_samples(&samples[..read]);
                 emit_decoded_frames(
                     &events,
@@ -1974,7 +2021,7 @@ fn build_runtime_input(
     downlink: &DownlinkDef,
     tuning_offset_hz: f32,
     cached_alignment: Option<&CachedAlignment>,
-    events: &Sender<RxEvent>,
+    events: &SyncSender<RxEvent>,
 ) -> Result<RuntimeInput, String> {
     match input_mode {
         InputMode::Soundcard => {
@@ -2126,7 +2173,7 @@ fn run_alignment_thread(
     path: PathBuf,
     downlink: DownlinkDef,
     tuning_offset_hz: f32,
-    events: Sender<RxEvent>,
+    events: SyncSender<RxEvent>,
 ) {
     let downlink_id = format!("{downlink:?}");
     let mut source = match WavIqSource::open(&path) {
@@ -2239,7 +2286,7 @@ fn run_alignment_thread(
 }
 
 fn emit_frames<P>(
-    events: &Sender<RxEvent>,
+    events: &SyncSender<RxEvent>,
     satellite: &SatelliteDefinition,
     telemetry: Option<&SchemaParser>,
     start: &Instant,
@@ -2265,7 +2312,7 @@ fn emit_frames<P>(
 }
 
 fn emit_decoded_frames(
-    events: &Sender<RxEvent>,
+    events: &SyncSender<RxEvent>,
     satellite: &SatelliteDefinition,
     telemetry: Option<&SchemaParser>,
     start: &Instant,
@@ -2683,122 +2730,174 @@ fn waterfall_color(value: f32) -> Color32 {
     }
 }
 
-fn spectrum_row_audio(
-    samples: &[f32],
-    bins: usize,
-    sample_rate: u32,
-    span_hz: u32,
-    window: &[f32],
-) -> Vec<f32> {
-    if samples.is_empty() || bins == 0 || sample_rate == 0 {
-        return vec![0.0; bins];
+/// FFT-backed spectrum analyzer.
+///
+/// Reuses one `rustfft` plan and a scratch buffer per call so consecutive
+/// rows pay no allocator / planner cost. Samples are zero-padded into the
+/// fixed FFT length, Hann-windowed, FFTed, magnitude-squared, then mapped
+/// onto `bins` output points by linearly interpolating the chosen frequency
+/// grid. The grid is symmetric around DC so audio and IQ spectra share the
+/// same display layout.
+struct SpectrumProcessor {
+    fft_len: usize,
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    buffer: Vec<Complex32>,
+    scratch: Vec<Complex32>,
+    powers: Vec<f32>,
+}
+
+impl SpectrumProcessor {
+    fn new(fft_len: usize) -> Self {
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_len);
+        let scratch_len = fft.get_inplace_scratch_len();
+        let window = (0..fft_len)
+            .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / (fft_len.max(2) - 1) as f32).cos())
+            .collect();
+        Self {
+            fft_len,
+            fft,
+            window,
+            buffer: vec![Complex32::new(0.0, 0.0); fft_len],
+            scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
+            powers: vec![0.0; fft_len],
+        }
     }
-    let n = samples.len().min(window.len());
-    let samples = &samples[..n];
+
+    fn run(&mut self) {
+        self.fft
+            .process_with_scratch(&mut self.buffer, &mut self.scratch);
+        let inv_n = 1.0 / self.fft_len as f32;
+        for (power, bin) in self.powers.iter_mut().zip(self.buffer.iter()) {
+            *power = (bin.re * bin.re + bin.im * bin.im) * inv_n;
+        }
+    }
+
+    fn row_audio(
+        &mut self,
+        samples: &[f32],
+        bins: usize,
+        sample_rate: u32,
+        span_hz: u32,
+    ) -> Vec<f32> {
+        if samples.is_empty() || bins == 0 || sample_rate == 0 {
+            return vec![WATERFALL_DB_FLOOR; bins];
+        }
+        let n = samples.len().min(self.fft_len);
+        for (i, sample) in samples.iter().take(n).enumerate() {
+            self.buffer[i] = Complex32::new(sample * self.window[i], 0.0);
+        }
+        for slot in &mut self.buffer[n..] {
+            *slot = Complex32::new(0.0, 0.0);
+        }
+        self.run();
+        // Real-input FFT is conjugate-symmetric, so we collapse positive and
+        // negative bins by averaging them and interpolate against the
+        // half-spectrum 0..fs/2.
+        sample_real_powers(&self.powers, bins, sample_rate, span_hz)
+    }
+
+    fn row_iq(
+        &mut self,
+        samples: &[IqSample],
+        bins: usize,
+        sample_rate: u32,
+        span_hz: u32,
+    ) -> Vec<f32> {
+        if samples.is_empty() || bins == 0 || sample_rate == 0 {
+            return vec![WATERFALL_DB_FLOOR; bins];
+        }
+        let n = samples.len().min(self.fft_len);
+        for (i, sample) in samples.iter().take(n).enumerate() {
+            let w = self.window[i];
+            self.buffer[i] = Complex32::new(sample.i * w, sample.q * w);
+        }
+        for slot in &mut self.buffer[n..] {
+            *slot = Complex32::new(0.0, 0.0);
+        }
+        self.run();
+        sample_complex_powers(&self.powers, self.fft_len, bins, sample_rate, span_hz)
+    }
+}
+
+/// Map a half-spectrum (real input) onto a symmetric display grid.
+fn sample_real_powers(powers: &[f32], bins: usize, sample_rate: u32, span_hz: u32) -> Vec<f32> {
+    let fft_len = powers.len();
+    let half = fft_len / 2;
+    let bin_hz = sample_rate as f32 / fft_len as f32;
     let half_span = span_hz as f32;
-    let frequencies = (0..bins).map(|bin| {
+    let mut row = Vec::with_capacity(bins);
+    for bin in 0..bins {
         let position = if bins == 1 {
             0.5
         } else {
             bin as f32 / (bins - 1) as f32
         };
-        -half_span + 2.0 * half_span * position
-    });
-    let powers = frequencies
-        .map(|frequency| dft_power_real(samples, window, sample_rate as f32, frequency.abs()))
-        .collect::<Vec<_>>();
-    power_row_to_db(&powers)
+        let frequency = (-half_span + 2.0 * half_span * position).abs();
+        let raw = frequency / bin_hz;
+        let lo = (raw.floor() as usize).min(half.saturating_sub(1));
+        let hi = (lo + 1).min(half.saturating_sub(1));
+        let t = raw - lo as f32;
+        let power = powers[lo] * (1.0 - t) + powers[hi] * t;
+        row.push(power_to_db(power));
+    }
+    row
 }
 
-fn spectrum_row_iq(
-    samples: &[IqSample],
+/// Map a full complex spectrum onto a symmetric display grid centered at DC.
+fn sample_complex_powers(
+    powers: &[f32],
+    fft_len: usize,
     bins: usize,
     sample_rate: u32,
     span_hz: u32,
-    window: &[f32],
 ) -> Vec<f32> {
-    if samples.is_empty() || bins == 0 || sample_rate == 0 {
-        return vec![0.0; bins];
-    }
-    let n = samples.len().min(window.len());
-    let samples = &samples[..n];
+    let bin_hz = sample_rate as f32 / fft_len as f32;
     let half_span = span_hz as f32;
-    let powers = (0..bins)
-        .map(|bin| {
-            let position = if bins == 1 {
-                0.5
-            } else {
-                bin as f32 / (bins - 1) as f32
-            };
-            let frequency = -half_span + 2.0 * half_span * position;
-            dft_power_iq(samples, window, sample_rate as f32, frequency)
-        })
-        .collect::<Vec<_>>();
-    power_row_to_db(&powers)
+    let mut row = Vec::with_capacity(bins);
+    for bin in 0..bins {
+        let position = if bins == 1 {
+            0.5
+        } else {
+            bin as f32 / (bins - 1) as f32
+        };
+        let frequency = -half_span + 2.0 * half_span * position;
+        // FFT bin layout: 0..N/2 are 0..fs/2, N/2..N are -fs/2..0.
+        let raw = frequency / bin_hz;
+        let signed = raw.round() as isize;
+        let idx = signed.rem_euclid(fft_len as isize) as usize;
+        let next = ((signed + 1).rem_euclid(fft_len as isize)) as usize;
+        let t = raw - signed as f32;
+        let power = powers[idx] * (1.0 - t) + powers[next] * t;
+        row.push(power_to_db(power));
+    }
+    row
 }
 
-fn dft_power_real(samples: &[f32], window: &[f32], sample_rate: f32, frequency_hz: f32) -> f32 {
-    let n = samples.len().min(window.len());
-    if n == 0 {
-        return 0.0;
+fn power_to_db(power: f32) -> f32 {
+    if power <= 0.0 {
+        WATERFALL_DB_FLOOR
+    } else {
+        (10.0 * power.log10()).clamp(WATERFALL_DB_FLOOR, WATERFALL_DB_CEIL)
     }
-    let step = (-2.0 * PI * frequency_hz / sample_rate).sin_cos();
-    let (step_im, step_re) = step;
-    let mut osc_re = 1.0;
-    let mut osc_im = 0.0;
-    let mut re = 0.0;
-    let mut im = 0.0;
-    for (index, sample) in samples.iter().take(n).enumerate() {
-        let weight = window[index];
-        re += sample * weight * osc_re;
-        im += sample * weight * osc_im;
-        let next_re = osc_re * step_re - osc_im * step_im;
-        osc_im = osc_re * step_im + osc_im * step_re;
-        osc_re = next_re;
-    }
-    (re * re + im * im) / n as f32
 }
 
-fn dft_power_iq(samples: &[IqSample], window: &[f32], sample_rate: f32, frequency_hz: f32) -> f32 {
-    let n = samples.len().min(window.len());
-    if n == 0 {
-        return 0.0;
+/// Format a Hz quantity into a short readable string ("48k", "1.4M").
+fn format_hz_short(hz: u32) -> String {
+    if hz >= 1_000_000 {
+        let m = hz as f32 / 1_000_000.0;
+        format!("{m:.2}M")
+    } else if hz >= 1_000 {
+        let k = hz as f32 / 1_000.0;
+        if k >= 100.0 {
+            format!("{k:.0}k")
+        } else {
+            format!("{k:.1}k")
+        }
+    } else {
+        format!("{hz}")
     }
-    let step = (-2.0 * PI * frequency_hz / sample_rate).sin_cos();
-    let (step_im, step_re) = step;
-    let mut osc_re = 1.0;
-    let mut osc_im = 0.0;
-    let mut re = 0.0;
-    let mut im = 0.0;
-    for (index, sample) in samples.iter().take(n).enumerate() {
-        let weight = window[index];
-        re += weight * (sample.i * osc_re - sample.q * osc_im);
-        im += weight * (sample.i * osc_im + sample.q * osc_re);
-        let next_re = osc_re * step_re - osc_im * step_im;
-        osc_im = osc_re * step_im + osc_im * step_re;
-        osc_re = next_re;
-    }
-    (re * re + im * im) / n as f32
-}
-
-fn hann_window(index: usize, len: usize) -> f32 {
-    if len <= 1 {
-        return 1.0;
-    }
-    0.5 - 0.5 * (2.0 * PI * index as f32 / (len - 1) as f32).cos()
-}
-
-fn power_row_to_db(powers: &[f32]) -> Vec<f32> {
-    powers
-        .iter()
-        .map(|power| {
-            if *power <= 0.0 {
-                WATERFALL_DB_FLOOR
-            } else {
-                (10.0 * power.log10()).clamp(WATERFALL_DB_FLOOR, WATERFALL_DB_CEIL)
-            }
-        })
-        .collect()
 }
 
 fn waterfall_image(waterfall: &VecDeque<Vec<f32>>, min_db: f32, max_db: f32) -> ColorImage {
@@ -2822,10 +2921,6 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
         (start as f32 + (end as f32 - start as f32) * t).clamp(0.0, 255.0) as u8
     };
     Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
-}
-
-fn build_hann_window(len: usize) -> Vec<f32> {
-    (0..len).map(|index| hann_window(index, len)).collect()
 }
 
 fn sat_label(satellite: &SatelliteDefinition) -> String {
