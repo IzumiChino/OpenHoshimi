@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_damaged_reed_solomon_packet() {
+    fn corrects_damaged_reed_solomon_packet() {
         let payload = b"csp-payload";
         let codeword = reed_solomon::encode_shortened(payload, 1);
         let mut packet = Vec::new();
@@ -239,11 +239,12 @@ mod tests {
         packet[4] ^= 0x20;
 
         let decoder = Ax100Decoder::new();
-        let err = match decoder.decode_reed_solomon(&packet) {
-            Ok(_) => panic!("damaged AX100 packet should fail"),
-            Err(err) => err,
+        let frame = match decoder.decode_reed_solomon(&packet) {
+            Ok(frame) => frame,
+            Err(err) => panic!("damaged AX100 packet should be corrected: {err}"),
         };
 
-        assert!(matches!(err, DecodeError::CrcMismatch));
+        assert_eq!(frame.payload, payload);
+        assert!(frame.corrected_errors > 0);
     }
 }

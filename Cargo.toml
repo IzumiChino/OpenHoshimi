@@ -6,8 +6,11 @@ members = [
     "crates/codec",
     "crates/telemetry",
     "crates/io",
+    "crates/runtime",
     "crates/app",
     "tools/decode_file",
+    "tools/iq_inspect",
+    "tools/cpm_dump",
 ]
 
 [workspace.package]
@@ -15,8 +18,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/openhoshimi/openhoshimi"
-authors = ["OpenHoshimi contributors"]
+repository = "https://github.com/IzumiChino/openhoshimi"
+authors = ["Izumi Chino"]
 
 [workspace.dependencies]
 openhoshimi-core = { path = "crates/core" }
@@ -24,14 +27,20 @@ openhoshimi-dsp = { path = "crates/dsp" }
 openhoshimi-codec = { path = "crates/codec" }
 openhoshimi-telemetry = { path = "crates/telemetry" }
 openhoshimi-io = { path = "crates/io" }
+openhoshimi-runtime = { path = "crates/runtime" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 toml = "0.8"
 hound = "3"
+cpal = "0.16"
+lewton = "0.10"
+ogg = "0.9"
 crc = "3"
 clap = { version = "4", features = ["derive"] }
 eframe = "0.31"
+egui_extras = "0.31"
+rfd = "0.14.1"
 
 [profile.release]
 lto = "thin"

@@ -1,16 +1,12 @@
 [package]
-name = "decode_file"
+name = "openhoshimi-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Offline WAV-to-frames decoding tool for OpenHoshimi"
-
-[[bin]]
-name = "decode_file"
-path = "src/main.rs"
+description = "Shared runtime state for OpenHoshimi decode pipelines"
 
 [dependencies]
 openhoshimi-core = { workspace = true }
@@ -18,5 +14,4 @@ openhoshimi-dsp = { workspace = true }
 openhoshimi-codec = { workspace = true }
 openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
-openhoshimi-runtime = { workspace = true }
-clap = { workspace = true }
+

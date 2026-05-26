@@ -6,7 +6,7 @@
 
 use openhoshimi_core::DecodeError;
 
-use crate::fec::{ccsds_randomizer, ReedSolomon, Viterbi};
+use crate::fec::{ccsds_randomizer, reed_solomon, viterbi, ReedSolomon, Viterbi};
 
 const AO40_PAYLOAD_LEN: usize = 256;
 const AO40_RS_CODEWORD_LEN: usize = 320;
@@ -15,6 +15,46 @@ const AO40_POST_VITERBI_BITS: usize = 2566;
 const AO40_POST_VITERBI_BYTES: usize = 321;
 const AO40_VITERBI_SYMBOLS: usize = AO40_POST_VITERBI_BITS * 2;
 const AO40_SYNCWORD: &str = "11111110000111011110010110010010000001000100110001011101011011000";
+
+/// Encoder for AO-40 FEC frames; emits the 5132-bit channel stream that
+/// would be transmitted (after the distributed-sync interleaver wraps it
+/// into a 5200-bit block). Used by codec roundtrip tests and by
+/// satellite-side simulation tooling.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Ao40FecEncoder;
+
+impl Ao40FecEncoder {
+    /// Construct a new AO-40 FEC encoder.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Encode a 256-byte payload into the 5132 channel bits emitted by the
+    /// transmitter before distributed-sync interleaving. Each output element
+    /// is a single bit packed in the low bit of a byte (0 or 1), matching
+    /// the input format expected by [`Ao40FecDecoder::decode_channel_bits`].
+    pub fn encode_to_channel_bits(&self, payload: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        if payload.len() != AO40_PAYLOAD_LEN {
+            return Err(DecodeError::InvalidEncoding(format!(
+                "AO-40 payload must be {AO40_PAYLOAD_LEN} bytes, got {}",
+                payload.len()
+            )));
+        }
+
+        let mut codeword = reed_solomon::encode_shortened(payload, AO40_INTERLEAVE);
+        ccsds_randomizer::xor_sequence(&mut codeword);
+
+        let mut bits = Vec::with_capacity(AO40_POST_VITERBI_BITS);
+        for byte in &codeword {
+            for shift in (0..8).rev() {
+                bits.push((byte >> shift) & 1);
+            }
+        }
+        bits.extend(std::iter::repeat(0u8).take(AO40_POST_VITERBI_BITS - bits.len()));
+
+        Ok(viterbi::encode_bits(&bits))
+    }
+}
 
 /// Decoder for AO-40 FEC post-Viterbi data.
 #[derive(Debug, Default, Clone, Copy)]
@@ -79,6 +119,25 @@ impl Ao40FecDecoder {
         let decoded = Viterbi::new().decode_bits(&bits[..AO40_VITERBI_SYMBOLS])?;
         self.decode_post_viterbi_bits(&decoded)
     }
+
+    /// Decode AO-40 data after distributed-sync framing using soft
+    /// per-bit confidence values.
+    ///
+    /// Each input element is a signed correlation value where positive
+    /// means the channel bit was received as `0` and negative means `1`;
+    /// magnitude is the per-bit reliability. Soft Viterbi decoding
+    /// recovers about 2 dB of coding gain compared with the hard-decision
+    /// path used by [`decode_channel_bits`](Self::decode_channel_bits),
+    /// which matters at the AO-73 link margin where many borderline
+    /// symbols would otherwise flip with no confidence information.
+    pub fn decode_soft_channel_bits(&self, symbols: &[i8]) -> Result<Ao40Frame, DecodeError> {
+        if symbols.len() < AO40_VITERBI_SYMBOLS {
+            return Err(DecodeError::TooShort(symbols.len() / 8));
+        }
+
+        let decoded = Viterbi::new().decode_soft_bits(&symbols[..AO40_VITERBI_SYMBOLS])?;
+        self.decode_post_viterbi_bits(&decoded)
+    }
 }
 
 /// Decoded AO-40 FEC payload.
@@ -88,8 +147,9 @@ pub struct Ao40Frame {
     pub payload: Vec<u8>,
     /// Number of Reed-Solomon byte errors corrected by this decoder.
     ///
-    /// The current implementation only accepts error-free RS codewords, so
-    /// this value is zero until full RS correction is implemented.
+    /// The decoder uses Berlekamp-Massey + Chien search + Forney algorithm,
+    /// so up to 16 byte errors can be corrected per RS(160,128) codeword,
+    /// or 32 byte errors total across the two interleaved codewords.
     pub corrected_errors: usize,
 }
 

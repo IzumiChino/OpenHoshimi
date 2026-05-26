@@ -1,0 +1,54 @@
+# AlfaCrux / Alfa Crux satellite definition.
+#
+# Reference: https://lodestar.aerospace.unb.br/projects/alfacrux
+#            https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#            https://db.satnogs.org/
+#
+# 1U CubeSat operated by the University of Brasilia LODESTAR group.
+# Launched 2022-04-01, IARU-coordinated 2022-07-05. Operational status as
+# of 2026 is active per SatNOGS observations. Beacon downlink is 4800 bd
+# GMSK on 437.100 MHz, using a GOMspace NanoCom AX100 transceiver in
+# ASM+Golay mode: a 32-bit attached sync marker, followed by a Golay(24,12)
+# header carrying the encoded payload length, then a CCSDS-randomized
+# shortened RS(255,223) codeword.
+#
+# Telemetry interpretation is intentionally omitted here: the AlfaCrux
+# beacon payload format is mission-specific and is not yet wired up in
+# this crate. The decode chain stops at the AX100 codec, surfacing the
+# de-randomized + RS-corrected payload bytes for downstream handling.
+
+[satellite]
+name = "AlfaCrux"
+aliases = ["ALFACRUX", "ALFA-CRUX"]
+norad_id = 52160
+
+[[downlink]]
+label = "4k8 GMSK telemetry beacon"
+freq_hz = 437_100_000
+modulation = "GMSK"
+baudrate = 4800
+framing = "GOMSPACE_AX100"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+# AX100 GMSK at the default modulation index h = 0.5 and BT = 0.5.
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.framer]
+kind = "ax100_asm"
+# Conservative ASM correlation threshold: tolerate up to 4 bit errors in
+# the 32-bit syncword.
+threshold = 4
+
+[downlink.fec]
+kind = "ax100"
+
+[downlink.codec]
+kind = "gomspace_ax100"
+mode = "asm_golay"

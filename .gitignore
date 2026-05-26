@@ -1,3 +1,12 @@
 # Rust build output.
 target/
 
+# IQ / audio captures and decoded dumps used as local test inputs.
+*.wav
+*.ogg
+*.zip
+*.iq.wav
+EMrecording*/
+Custom_Signal/
+test_data/
+frame*.bin

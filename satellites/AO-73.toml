@@ -3,17 +3,20 @@
 # Reference: https://www.amsat.org/two-way-satellites/ao-73-funcube-1/
 #            https://amsat-uk.org/satellites/comms/funcube-1/
 #            https://www.sigidwiki.com/wiki/FUNcube-1_Telemetry
+#            https://github.com/daniestevez/gr-satellites/blob/main/python/telemetry/funcube.py
 #
 # Launched 2013-11-21. 1200 bd BPSK educational telemetry beacon on
 # 145.935 MHz, encoded with the AMSAT AO-40 FEC scheme (256-byte payload
-# wrapped in CRC-16, scrambled, convolutionally coded with rate-1/2 K=7,
+# wrapped with CRC-16, scrambled, convolutionally coded with rate-1/2 K=7,
 # interleaved into a 5200-symbol block, then differentially BPSK
 # modulated). The mode-U/V linear transponder activates during eclipse.
 #
-# Telemetry field offsets below cover a representative subset of the
-# 256-byte FUNcube payload - not the full set. They are sufficient to
-# exercise the schema; the full RT/WO/HR layout will be filled in with the
-# telemetry parser.
+# The 256-byte AO-40 FEC payload is densely bit-packed. The telemetry
+# layout below mirrors the BitStruct schema in gr-satellites' funcube.py
+# (RealTimeFC1: header + EPSFC1 + BOB + RF + PA + Ants + SWFC1). Bit
+# offsets are absolute from byte 0, bit 7 (MSB-first). Calibration
+# polynomials come from the same source; temperatures are in degrees
+# Celsius, currents in ADC-derived engineering units.
 
 [satellite]
 name = "AO-73"
@@ -31,11 +34,22 @@ telemetry_schema = "funcube_1"
 [downlink.modem]
 kind = "linear"
 mode = "dbpsk"
+frequency_offset_hz = 0.0
 differential = true
+swap_iq = true
+# Costas tracks tight phase. NCO clamp spans the LEO Doppler swing
+# (~3-4 kHz at 145 MHz over a 4-min pass) so Costas can pull DC offset
+# back to baseband without saturating. FLL is currently disabled: the
+# Kay-on-squared-symbols discriminator is too noisy at this SNR and
+# perturbs the Costas-only solution rather than helping. Lock-retention
+# bottleneck is being investigated separately.
+carrier_loop_bandwidth = 0.01
+frequency_loop_bandwidth = 0.0
+nco_max_offset_hz = 8000.0
 
 [downlink.framer]
 kind = "ao40"
-threshold = 0
+threshold = 8
 
 [downlink.fec]
 kind = "ao40"
@@ -45,94 +59,409 @@ kind = "ao40_fec"
 
 [telemetry.funcube_1]
 
-[[telemetry.funcube_1.field]]
-name = "frame_id"
-group = "header"
-offset = 0
-length = 1
-endian = "big"
-unit = ""
+# ---------------------------------------------------------------------------
+# Header (8 bits): 2-bit satid + 6-bit frametype.
+# Frametypes 0/1/2 carry RealTime telemetry; 3..7 are WO; 8..0x47 are HR.
+# Only RealTime fields are decoded below.
+# ---------------------------------------------------------------------------
 
 [[telemetry.funcube_1.field]]
-name = "sequence"
+name = "satid"
 group = "header"
-offset = 1
-length = 2
-endian = "big"
+bit_offset = 0
+bit_length = 2
 
 [[telemetry.funcube_1.field]]
-name = "bus_voltage"
+name = "frametype"
+group = "header"
+bit_offset = 2
+bit_length = 6
+
+# ---------------------------------------------------------------------------
+# EPS (24 bytes / 192 bits) - electrical power subsystem telemetry.
+# Three 16-bit photovoltaic readings followed by photocurrent, battery /
+# system / boost temps, latch-up counts, reset cause, MPPT mode.
+# ---------------------------------------------------------------------------
+
+[[telemetry.funcube_1.field]]
+name = "eps_photovoltage_x_plus"
 group = "eps"
-offset = 3
-length = 2
-endian = "big"
+bit_offset = 8
+bit_length = 16
+unit = "mV"
+
+[[telemetry.funcube_1.field]]
+name = "eps_photovoltage_x_minus"
+group = "eps"
+bit_offset = 24
+bit_length = 16
+unit = "mV"
+
+[[telemetry.funcube_1.field]]
+name = "eps_photovoltage_y"
+group = "eps"
+bit_offset = 40
+bit_length = 16
+unit = "mV"
+
+[[telemetry.funcube_1.field]]
+name = "eps_photocurrent"
+group = "eps"
+bit_offset = 56
+bit_length = 16
+unit = "mA"
+
+[[telemetry.funcube_1.field]]
+name = "eps_battery_voltage"
+group = "eps"
+bit_offset = 72
+bit_length = 16
 scale = 0.001
 unit = "V"
 warn_below = 6.5
 warn_above = 8.4
 
 [[telemetry.funcube_1.field]]
-name = "bus_current"
+name = "eps_system_current"
 group = "eps"
-offset = 5
-length = 2
-endian = "big"
-scale = 0.001
-unit = "A"
+bit_offset = 88
+bit_length = 16
+unit = "mA"
 
 [[telemetry.funcube_1.field]]
-name = "solar_x_plus_voltage"
+name = "eps_reboot_count"
 group = "eps"
-offset = 7
-length = 2
-endian = "big"
-scale = 0.001
-unit = "V"
+bit_offset = 104
+bit_length = 16
 
 [[telemetry.funcube_1.field]]
-name = "solar_x_minus_voltage"
+name = "eps_software_errors"
 group = "eps"
-offset = 9
-length = 2
-endian = "big"
-scale = 0.001
-unit = "V"
+bit_offset = 120
+bit_length = 16
 
 [[telemetry.funcube_1.field]]
-name = "temp_pa"
-group = "thermal"
-offset = 24
-length = 2
-endian = "big"
-scale = 0.1
-bias = -273.15
+name = "eps_boost_temp_x"
+group = "eps"
+bit_offset = 136
+bit_length = 8
 unit = "C"
-warn_above = 50.0
 
 [[telemetry.funcube_1.field]]
-name = "temp_battery"
-group = "thermal"
-offset = 26
-length = 2
-endian = "big"
-scale = 0.1
-bias = -273.15
+name = "eps_boost_temp_y"
+group = "eps"
+bit_offset = 144
+bit_length = 8
+unit = "C"
+
+[[telemetry.funcube_1.field]]
+name = "eps_boost_temp_z"
+group = "eps"
+bit_offset = 152
+bit_length = 8
+unit = "C"
+
+[[telemetry.funcube_1.field]]
+name = "eps_battery_temp"
+group = "eps"
+bit_offset = 160
+bit_length = 8
 unit = "C"
 warn_below = -10.0
 warn_above = 45.0
 
 [[telemetry.funcube_1.field]]
-name = "rx_doppler"
-group = "comms"
-offset = 30
-length = 2
-endian = "big"
+name = "eps_latchup_count_5v"
+group = "eps"
+bit_offset = 168
+bit_length = 8
+
+[[telemetry.funcube_1.field]]
+name = "eps_latchup_count_3v3"
+group = "eps"
+bit_offset = 176
+bit_length = 8
+
+[[telemetry.funcube_1.field]]
+name = "eps_reset_cause"
+group = "eps"
+bit_offset = 184
+bit_length = 8
+
+[[telemetry.funcube_1.field]]
+name = "eps_mppt_mode"
+group = "eps"
+bit_offset = 192
+bit_length = 8
+
+# ---------------------------------------------------------------------------
+# BOB (100 bits) - On-Board Computer / panel sensors. Three 10-bit
+# sun-sensor channels, four 10-bit panel temperatures, then 3v3 / 5v
+# rail voltages and 3v3 current. Calibration adapters from gr-satellites.
+# ---------------------------------------------------------------------------
+
+[[telemetry.funcube_1.field]]
+name = "bob_sunsensor_x_plus"
+group = "sun"
+bit_offset = 200
+bit_length = 10
+
+[[telemetry.funcube_1.field]]
+name = "bob_sunsensor_x_minus"
+group = "sun"
+bit_offset = 210
+bit_length = 10
+
+[[telemetry.funcube_1.field]]
+name = "bob_sunsensor_y"
+group = "sun"
+bit_offset = 220
+bit_length = 10
+
+# Panel temp calibrations are linear with the gr-satellites coefficients,
+# which already produce engineering Celsius values from the 10-bit ADC.
+[[telemetry.funcube_1.field]]
+name = "panel_temp_x_plus"
+group = "thermal"
+bit_offset = 230
+bit_length = 10
+scale = -0.2073
+bias = 158.239
+unit = "C"
+warn_below = -40.0
+warn_above = 80.0
+
+[[telemetry.funcube_1.field]]
+name = "panel_temp_x_minus"
+group = "thermal"
+bit_offset = 240
+bit_length = 10
+scale = -0.2083
+bias = 159.227
+unit = "C"
+warn_below = -40.0
+warn_above = 80.0
+
+[[telemetry.funcube_1.field]]
+name = "panel_temp_y_plus"
+group = "thermal"
+bit_offset = 250
+bit_length = 10
+scale = -0.2076
+bias = 158.656
+unit = "C"
+warn_below = -40.0
+warn_above = 80.0
+
+[[telemetry.funcube_1.field]]
+name = "panel_temp_y_minus"
+group = "thermal"
+bit_offset = 260
+bit_length = 10
+scale = -0.2087
+bias = 159.045
+unit = "C"
+warn_below = -40.0
+warn_above = 80.0
+
+# Bus voltages: gr-satellites adapters express raw ADC counts as 4*x and
+# 6*x mV; we convert directly to volts with scale 0.004 / 0.006.
+[[telemetry.funcube_1.field]]
+name = "bus_3v3_voltage"
+group = "eps"
+bit_offset = 270
+bit_length = 10
+scale = 0.004
+unit = "V"
+
+[[telemetry.funcube_1.field]]
+name = "bus_3v3_current"
+group = "eps"
+bit_offset = 280
+bit_length = 10
+unit = "mA"
+
+[[telemetry.funcube_1.field]]
+name = "bus_5v_voltage"
+group = "eps"
+bit_offset = 290
+bit_length = 10
+scale = 0.006
+unit = "V"
+
+# ---------------------------------------------------------------------------
+# RF (48 bits) - Doppler offset, RSSI, RF board temp, RX/TX currents.
+# ---------------------------------------------------------------------------
+
+[[telemetry.funcube_1.field]]
+name = "rf_rx_doppler"
+group = "rf"
+bit_offset = 300
+bit_length = 8
 unit = "Hz"
 
 [[telemetry.funcube_1.field]]
-name = "rx_rssi"
-group = "comms"
-offset = 32
-length = 1
-endian = "big"
+name = "rf_rx_rssi"
+group = "rf"
+bit_offset = 308
+bit_length = 8
 unit = "dBm"
+
+[[telemetry.funcube_1.field]]
+name = "rf_temp"
+group = "rf"
+bit_offset = 316
+bit_length = 8
+scale = -0.857
+bias = 193.672
+unit = "C"
+
+[[telemetry.funcube_1.field]]
+name = "rf_rx_current"
+group = "rf"
+bit_offset = 324
+bit_length = 8
+scale = 0.636
+unit = "mA"
+
+[[telemetry.funcube_1.field]]
+name = "rf_tx_3v3_current"
+group = "rf"
+bit_offset = 332
+bit_length = 8
+scale = 0.636
+unit = "mA"
+
+[[telemetry.funcube_1.field]]
+name = "rf_tx_5v_current"
+group = "rf"
+bit_offset = 340
+bit_length = 8
+scale = 1.272
+unit = "mA"
+
+# ---------------------------------------------------------------------------
+# PA (32 bits) - power amplifier reverse / forward power, board temp
+# (raw ADC, no linear adapter), board current.
+# ---------------------------------------------------------------------------
+
+[[telemetry.funcube_1.field]]
+name = "pa_reverse_power"
+group = "pa"
+bit_offset = 348
+bit_length = 8
+scale = 5e-3
+power = 2.0629
+unit = "mW"
+
+[[telemetry.funcube_1.field]]
+name = "pa_forward_power"
+group = "pa"
+bit_offset = 356
+bit_length = 8
+scale = 5e-3
+power = 2.0629
+unit = "mW"
+
+[[telemetry.funcube_1.field]]
+name = "pa_board_temp"
+group = "pa"
+bit_offset = 364
+bit_length = 8
+
+[[telemetry.funcube_1.field]]
+name = "pa_board_current"
+group = "pa"
+bit_offset = 372
+bit_length = 8
+scale = 0.5496
+bias = 2.5435
+unit = "mA"
+
+# ---------------------------------------------------------------------------
+# Antennas (20 bits) - two 8-bit temp readings followed by four
+# deployment flags packed into the trailing 4 bits.
+# ---------------------------------------------------------------------------
+
+[[telemetry.funcube_1.field]]
+name = "ants_temp_a"
+group = "ants"
+bit_offset = 380
+bit_length = 8
+
+[[telemetry.funcube_1.field]]
+name = "ants_temp_b"
+group = "ants"
+bit_offset = 388
+bit_length = 8
+
+[[telemetry.funcube_1.field]]
+name = "ants_deployment_flags"
+group = "ants"
+bit_offset = 396
+bit_length = 4
+
+# ---------------------------------------------------------------------------
+# SW (48 bits) - software status: sequence number, DTMF state, valid
+# flags, eclipse / safemode / ABF / deployment-wait bits.
+# ---------------------------------------------------------------------------
+
+[[telemetry.funcube_1.field]]
+name = "sw_seqnumber"
+group = "sw"
+bit_offset = 400
+bit_length = 24
+
+[[telemetry.funcube_1.field]]
+name = "sw_dtmf_cmd_count"
+group = "sw"
+bit_offset = 424
+bit_length = 6
+
+[[telemetry.funcube_1.field]]
+name = "sw_dtmf_last_cmd"
+group = "sw"
+bit_offset = 430
+bit_length = 5
+
+[[telemetry.funcube_1.field]]
+name = "sw_dtmf_cmd_success"
+group = "sw"
+bit_offset = 435
+bit_length = 1
+
+[[telemetry.funcube_1.field]]
+name = "sw_data_valid"
+group = "sw"
+bit_offset = 436
+bit_length = 7
+
+[[telemetry.funcube_1.field]]
+name = "sw_eclipse"
+group = "sw"
+bit_offset = 443
+bit_length = 1
+
+[[telemetry.funcube_1.field]]
+name = "sw_safemode"
+group = "sw"
+bit_offset = 444
+bit_length = 1
+
+[[telemetry.funcube_1.field]]
+name = "sw_hw_abf"
+group = "sw"
+bit_offset = 445
+bit_length = 1
+
+[[telemetry.funcube_1.field]]
+name = "sw_sw_abf"
+group = "sw"
+bit_offset = 446
+bit_length = 1
+
+[[telemetry.funcube_1.field]]
+name = "sw_deployment_wait"
+group = "sw"
+bit_offset = 447
+bit_length = 1

@@ -18,4 +18,7 @@ openhoshimi-dsp = { workspace = true }
 openhoshimi-codec = { workspace = true }
 openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
+openhoshimi-runtime = { workspace = true }
 eframe = { workspace = true }
+egui_extras = { workspace = true }
+rfd = { workspace = true }

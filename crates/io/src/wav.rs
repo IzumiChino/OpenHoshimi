@@ -25,6 +25,8 @@ type IqIter = Box<dyn Iterator<Item = Result<IqSample, hound::Error>> + Send>;
 pub struct WavSource {
     iter: SampleIter,
     sample_rate: u32,
+    total_samples: Option<u64>,
+    read_samples: u64,
     description: String,
     eof: bool,
 }
@@ -37,6 +39,8 @@ pub struct WavSource {
 pub struct WavIqSource {
     iter: IqIter,
     sample_rate: u32,
+    total_samples: Option<u64>,
+    read_samples: u64,
     description: String,
     eof: bool,
 }
@@ -55,6 +59,7 @@ impl WavSource {
         let spec = reader.spec();
         let channels = spec.channels.max(1) as usize;
         let sample_rate = spec.sample_rate;
+        let total_samples = Some(reader.duration() as u64 / channels as u64);
 
         let description = format!(
             "WAV file {} ({} Hz, {}-bit {}, {} channel{})",
@@ -108,9 +113,16 @@ impl WavSource {
         Ok(Self {
             iter,
             sample_rate,
+            total_samples,
+            read_samples: 0,
             description,
             eof: false,
         })
+    }
+
+    /// Return the total number of logical samples in the file, if known.
+    pub fn total_samples(&self) -> Option<u64> {
+        self.total_samples
     }
 }
 
@@ -135,6 +147,7 @@ impl WavIqSource {
 
         let channels = spec.channels as usize;
         let sample_rate = spec.sample_rate;
+        let total_samples = Some(reader.duration() as u64 / channels as u64);
         let description = format!(
             "WAV IQ file {} ({} Hz, {}-bit {}, {} channel{})",
             path.display(),
@@ -177,9 +190,21 @@ impl WavIqSource {
         Ok(Self {
             iter,
             sample_rate,
+            total_samples,
+            read_samples: 0,
             description,
             eof: false,
         })
+    }
+
+    /// Return the total number of logical samples in the file, if known.
+    pub fn total_samples(&self) -> Option<u64> {
+        self.total_samples
+    }
+
+    /// Return the number of logical samples already read from the file.
+    pub fn read_samples(&self) -> u64 {
+        self.read_samples
     }
 }
 
@@ -208,6 +233,7 @@ impl InputSource for WavSource {
         if written == 0 {
             return Err(IoError::EndOfStream);
         }
+        self.read_samples += written as u64;
         Ok(written)
     }
 
@@ -217,6 +243,10 @@ impl InputSource for WavSource {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn total_samples(&self) -> Option<u64> {
+        self.total_samples
     }
 }
 
@@ -245,6 +275,7 @@ impl IqSource for WavIqSource {
         if written == 0 {
             return Err(IoError::EndOfStream);
         }
+        self.read_samples += written as u64;
         Ok(written)
     }
 
@@ -254,6 +285,10 @@ impl IqSource for WavIqSource {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn total_samples(&self) -> Option<u64> {
+        self.total_samples
     }
 }
 
@@ -460,7 +495,7 @@ mod tests {
             Err(err) => panic!("open: {err}"),
         };
         let mut buf = [IqSample::default(); 4];
-        let n = match src.read_samples(&mut buf) {
+        let n = match IqSource::read_samples(&mut src, &mut buf) {
             Ok(n) => n,
             Err(err) => panic!("read: {err}"),
         };

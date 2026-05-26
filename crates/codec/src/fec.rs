@@ -44,6 +44,19 @@ impl Viterbi {
     pub fn decode_bits(&self, symbols: &[u8]) -> Result<Vec<u8>, DecodeError> {
         viterbi::decode_bits(symbols)
     }
+
+    /// Decode signed soft symbols into one-bit-per-byte payload bits.
+    ///
+    /// Each input element carries one channel bit as a signed correlation
+    /// value: positive means the matched filter output is closer to a `0`
+    /// transmitted bit, negative means closer to `1`. Magnitude encodes the
+    /// per-bit confidence; values near zero contribute little to the path
+    /// metric. Soft decoding recovers roughly 2 dB of coding gain compared
+    /// to [`decode_bits`](Self::decode_bits) at the cost of carrying a byte
+    /// per channel bit instead of a packed bit.
+    pub fn decode_soft_bits(&self, symbols: &[i8]) -> Result<Vec<u8>, DecodeError> {
+        viterbi::decode_soft_bits(symbols)
+    }
 }
 
 impl Fec for Viterbi {
@@ -57,16 +70,19 @@ pub(crate) mod ccsds_randomizer {
     const INITIAL_STATE: u8 = 0xff;
 
     pub(crate) fn xor_sequence(bytes: &mut [u8]) {
+        // CCSDS 131.0-B pseudo-random sequence: right-shift Fibonacci LFSR.
+        // Output is the LSB taken before each shift; feedback (parity over
+        // the tap mask) is shifted into the MSB. Byte fill order is MSB
+        // first so that the very first emitted bit lands in bit 7.
         let mut state = INITIAL_STATE;
         for byte in bytes {
             let mut mask = 0u8;
             for bit_index in 0..8 {
-                let pn = state & 0x80 != 0;
-                if pn {
+                if state & 1 != 0 {
                     mask |= 1 << (7 - bit_index);
                 }
                 let feedback = (state & POLY_MASK).count_ones() & 1 != 0;
-                state = (state << 1) | u8::from(feedback);
+                state = (state >> 1) | (u8::from(feedback) << 7);
             }
             *byte ^= mask;
         }
@@ -87,6 +103,22 @@ pub(crate) mod ccsds_randomizer {
 
             assert_eq!(data, original);
         }
+
+        #[test]
+        fn sequence_matches_ccsds_blue_book() {
+            // CCSDS 131.0-B Annex F pseudo-random sequence, first 16 bytes.
+            // Polynomial h(x) = x^8 + x^7 + x^5 + x^3 + 1, all-1 initial
+            // state, MSB of register output first. This is the canonical
+            // sequence KA9Q's randomizer.c emits and what AO-40 / FUNcube
+            // descramblers expect.
+            const EXPECTED: [u8; 16] = [
+                0xff, 0x48, 0x0e, 0xc0, 0x9a, 0x0d, 0x70, 0xbc, 0x8e, 0x2c, 0x93, 0xad, 0xa7, 0xb7,
+                0x46, 0xce,
+            ];
+            let mut zeros = [0u8; 16];
+            xor_sequence(&mut zeros);
+            assert_eq!(zeros, EXPECTED);
+        }
     }
 }
 
@@ -95,8 +127,8 @@ pub(crate) mod viterbi {
 
     const STATES: usize = 64;
     const K: usize = 7;
-    const G1: u8 = 0o171;
-    const G2: u8 = 0o133;
+    const G1: u8 = 0x4f;
+    const G2: u8 = 0x6d;
     const INF: u32 = u32::MAX / 4;
     const SECOND_SYMBOL_INVERTED: bool = true;
 
@@ -152,8 +184,87 @@ pub(crate) mod viterbi {
         Ok(decoded)
     }
 
-    #[cfg(test)]
-    pub(crate) fn encode_bits(bits: &[u8]) -> Vec<u8> {
+    pub(crate) fn decode_soft_bits(symbols: &[i8]) -> Result<Vec<u8>, DecodeError> {
+        if symbols.len() < 2 || symbols.len() / 2 * 2 != symbols.len() {
+            return Err(DecodeError::InvalidEncoding(
+                "Viterbi input must contain pairs of symbols".to_string(),
+            ));
+        }
+
+        // Each soft sample is mapped so that a transmitted `0` corresponds
+        // to a positive correlation and a transmitted `1` to a negative
+        // correlation. The branch metric is the squared Euclidean distance
+        // between the received pair and the expected (±S, ±S) constellation
+        // point, with S = 64 chosen as the soft-decision center. This keeps
+        // the metric in u32 range for the 5132-bit AO-40 stream.
+        const SOFT_CENTER: i32 = 64;
+
+        let steps = symbols.len() / 2;
+        let mut metrics = [INF; STATES];
+        metrics[0] = 0;
+        let mut decisions = vec![[0u8; STATES]; steps];
+
+        for step in 0..steps {
+            let received = [
+                i32::from(symbols[step * 2]),
+                i32::from(symbols[step * 2 + 1]),
+            ];
+            let mut next_metrics = [INF; STATES];
+
+            for (state, metric) in metrics.iter().enumerate() {
+                if *metric == INF {
+                    continue;
+                }
+                for bit in 0..=1u8 {
+                    let next_state = ((state << 1) | usize::from(bit)) & (STATES - 1);
+                    let encoded = encode_branch(state as u8, bit);
+                    let expected_a = if encoded[0] == 0 {
+                        SOFT_CENTER
+                    } else {
+                        -SOFT_CENTER
+                    };
+                    let expected_b = if encoded[1] == 0 {
+                        SOFT_CENTER
+                    } else {
+                        -SOFT_CENTER
+                    };
+                    let diff_a = received[0] - expected_a;
+                    let diff_b = received[1] - expected_b;
+                    let branch_metric = (diff_a * diff_a + diff_b * diff_b) as u32;
+                    let candidate = metric.saturating_add(branch_metric);
+                    if candidate < next_metrics[next_state] {
+                        next_metrics[next_state] = candidate;
+                        decisions[step][next_state] = (state as u8) | (bit << 6);
+                    }
+                }
+            }
+
+            metrics = next_metrics;
+        }
+
+        let mut state = metrics
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, metric)| *metric)
+            .map(|(state, _)| state)
+            .ok_or_else(|| DecodeError::InvalidEncoding("empty Viterbi trellis".to_string()))?;
+
+        let mut decoded = vec![0u8; steps];
+        for step in (0..steps).rev() {
+            let decision = decisions[step][state];
+            decoded[step] = (decision >> 6) & 1;
+            state = usize::from(decision & 0x3f);
+        }
+
+        Ok(decoded)
+    }
+
+    /// Convolutionally encode one-bit-per-byte input into hard channel bits.
+    ///
+    /// Used by the AO-40 encoder path and by codec roundtrip tests; mirrors
+    /// the decoder's CCSDS K=7 rate-1/2 polynomial convention with G2
+    /// inverted.
+    pub fn encode_bits(bits: &[u8]) -> Vec<u8> {
         let mut state = 0u8;
         let mut out = Vec::with_capacity(bits.len() * 2);
         for &bit in bits {
@@ -219,6 +330,53 @@ pub(crate) mod viterbi {
             };
 
             assert!(matches!(err, DecodeError::InvalidEncoding(_)));
+        }
+
+        fn soft_from_hard(symbols: &[u8], scale: i8) -> Vec<i8> {
+            symbols
+                .iter()
+                .map(|bit| if bit & 1 == 0 { scale } else { -scale })
+                .collect()
+        }
+
+        #[test]
+        fn soft_decodes_clean_symbols() {
+            let bits: Vec<u8> = (0..96).map(|i| u8::from(i % 5 == 0)).collect();
+            let hard = encode_bits(&bits);
+            let soft = soft_from_hard(&hard, 64);
+
+            let decoded = match decode_soft_bits(&soft) {
+                Ok(decoded) => decoded,
+                Err(err) => panic!("valid soft Viterbi symbols: {err}"),
+            };
+
+            assert_eq!(decoded, bits);
+        }
+
+        #[test]
+        fn soft_corrects_more_errors_than_hard() {
+            // Construct a deterministic 256-bit message and inject the same
+            // dense pattern of channel errors into the hard-bit stream and
+            // the matching soft stream. Soft decoding should still recover
+            // the message in cases where hard fails because magnitude carries
+            // confidence about the unflipped symbols.
+            let bits: Vec<u8> = (0..256).map(|i| u8::from(i % 3 == 0)).collect();
+            let hard = encode_bits(&bits);
+            let mut hard_corrupt = hard.clone();
+            let mut soft_corrupt = soft_from_hard(&hard, 64);
+            for index in (5..hard_corrupt.len()).step_by(11) {
+                hard_corrupt[index] ^= 1;
+                // Flip the soft sign but keep a smaller magnitude: this is
+                // an unreliable received bit, which is exactly what soft
+                // decoding is designed to deweight.
+                soft_corrupt[index] = -soft_corrupt[index] / 4;
+            }
+
+            let soft_decoded = match decode_soft_bits(&soft_corrupt) {
+                Ok(decoded) => decoded,
+                Err(err) => panic!("correctable soft symbols: {err}"),
+            };
+            assert_eq!(soft_decoded, bits);
         }
     }
 }
@@ -400,7 +558,6 @@ pub(crate) mod reed_solomon {
         20, 93, 248, 151, 46, 75, 185, 96, 15, 237, 62, 229, 246, 135, 165, 23, 58, 163, 60, 183,
     ];
 
-    #[cfg(test)]
     const GENERATOR_POLY: [u8; PARITY_LEN + 1] = [
         0, 249, 59, 66, 4, 43, 126, 251, 97, 30, 3, 213, 50, 66, 170, 5, 24, 5, 170, 66, 50, 213,
         3, 30, 97, 251, 126, 43, 4, 66, 59, 249, 0,
@@ -451,8 +608,12 @@ pub(crate) mod reed_solomon {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn encode_shortened(message: &[u8], interleave: usize) -> Vec<u8> {
+    /// Encode an interleaved shortened RS message and append parity.
+    ///
+    /// Used by the AO-40 encoder path and codec roundtrip tests; matches the
+    /// (160,128) shortened-from-(255,223) layout the decoder expects with
+    /// CCSDS FCR=112 and PRIM=11.
+    pub fn encode_shortened(message: &[u8], interleave: usize) -> Vec<u8> {
         let rs_nn = message.len() / interleave + PARITY_LEN;
         let mut out = vec![0u8; rs_nn * interleave];
 
@@ -470,30 +631,176 @@ pub(crate) mod reed_solomon {
         out
     }
 
+    const IPRIM: usize = 116;
+
     fn decode_block(data: &mut [u8; NN], pad: usize) -> Result<usize, DecodeError> {
-        let mut syndromes = [0u8; PARITY_LEN];
-        for (i, syndrome) in syndromes.iter_mut().enumerate() {
-            *syndrome = data[pad];
+        let nroots = PARITY_LEN;
+
+        let mut s_val = [0u8; PARITY_LEN];
+        for (i, syn) in s_val.iter_mut().enumerate() {
+            *syn = data[pad];
             for &symbol in data.iter().skip(pad + 1) {
-                if *syndrome == 0 {
-                    *syndrome = symbol;
+                if *syn == 0 {
+                    *syn = symbol;
                 } else {
-                    let exponent =
-                        usize::from(index_of(*syndrome)) + ((FCR + i as i32) * PRIM) as usize;
-                    *syndrome = symbol ^ alpha_to(mod_nn(exponent));
+                    let exp = usize::from(index_of(*syn)) + ((FCR + i as i32) * PRIM) as usize;
+                    *syn = symbol ^ alpha_to(mod_nn(exp));
                 }
             }
         }
 
-        let has_error = syndromes.iter().any(|syndrome| *syndrome != 0);
-        if !has_error {
+        if s_val.iter().all(|s| *s == 0) {
             return Ok(0);
         }
 
-        Err(DecodeError::CrcMismatch)
+        let s: Vec<usize> = s_val.iter().map(|&v| usize::from(index_of(v))).collect();
+
+        // Berlekamp-Massey (lambda and b in value form)
+        let mut lambda = [0u8; PARITY_LEN + 1];
+        lambda[0] = 1;
+        let mut b = [0u8; PARITY_LEN + 1];
+        b[0] = 1;
+        let mut el = 0usize;
+
+        for r in 0..nroots {
+            let mut discr = s_val[r];
+            for i in 1..=el.min(nroots - 1) {
+                if lambda[i] != 0 && s[r - i] != NN {
+                    discr ^= alpha_to(mod_nn(usize::from(index_of(lambda[i])) + s[r - i]));
+                }
+            }
+
+            if discr == 0 {
+                b.copy_within(..nroots, 1);
+                b[0] = 0;
+            } else {
+                let discr_idx = usize::from(index_of(discr));
+                let mut t = lambda;
+                for i in 0..nroots {
+                    if b[i] != 0 {
+                        t[i + 1] ^= alpha_to(mod_nn(discr_idx + usize::from(index_of(b[i]))));
+                    }
+                }
+
+                if 2 * el <= r {
+                    el = r + 1 - el;
+                    let discr_inv = NN - discr_idx;
+                    for i in 0..=nroots {
+                        b[i] = if lambda[i] != 0 {
+                            alpha_to(mod_nn(usize::from(index_of(lambda[i])) + discr_inv))
+                        } else {
+                            0
+                        };
+                    }
+                } else {
+                    b.copy_within(..nroots, 1);
+                    b[0] = 0;
+                }
+
+                lambda = t;
+            }
+        }
+
+        let deg_lambda = match lambda.iter().rposition(|&v| v != 0) {
+            Some(d) if d > 0 && d <= nroots / 2 => d,
+            _ => return Err(DecodeError::CrcMismatch),
+        };
+
+        let lambda_idx: [usize; PARITY_LEN + 1] = {
+            let mut arr = [NN; PARITY_LEN + 1];
+            for (i, &v) in lambda.iter().enumerate() {
+                arr[i] = usize::from(index_of(v));
+            }
+            arr
+        };
+
+        // Chien search
+        let mut reg = lambda_idx;
+        let mut root = [0usize; PARITY_LEN];
+        let mut loc = [0usize; PARITY_LEN];
+        let mut count = 0usize;
+        let mut k = IPRIM - 1;
+
+        for i in 1..=NN {
+            let mut q = 1u8;
+            for j in (1..=deg_lambda).rev() {
+                if reg[j] != NN {
+                    reg[j] = mod_nn(reg[j] + j);
+                    q ^= alpha_to(reg[j]);
+                }
+            }
+            if q == 0 {
+                if k < pad {
+                    return Err(DecodeError::CrcMismatch);
+                }
+                root[count] = i;
+                loc[count] = k;
+                count += 1;
+                if count >= deg_lambda {
+                    break;
+                }
+            }
+            k = if k + IPRIM >= NN {
+                k + IPRIM - NN
+            } else {
+                k + IPRIM
+            };
+        }
+
+        if count != deg_lambda {
+            return Err(DecodeError::CrcMismatch);
+        }
+
+        // Omega(x) = S(x)*Lambda(x) mod x^nroots
+        let deg_omega = deg_lambda - 1;
+        let mut omega = [NN; PARITY_LEN + 1];
+        for i in 0..=deg_omega {
+            let mut tmp = 0u8;
+            for j in (0..=i).rev() {
+                if s[j] != NN && lambda_idx[i - j] != NN {
+                    tmp ^= alpha_to(mod_nn(s[j] + lambda_idx[i - j]));
+                }
+            }
+            omega[i] = usize::from(index_of(tmp));
+        }
+
+        // Forney
+        for j in 0..count {
+            let mut num1 = 0u8;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..=deg_omega {
+                if omega[i] != NN {
+                    num1 ^= alpha_to(mod_nn(omega[i] + i * root[j]));
+                }
+            }
+            let num2 = alpha_to(mod_nn(root[j] * ((FCR as usize) - 1) + NN));
+
+            let mut den = 0u8;
+            let mut i = (deg_lambda.min(nroots - 1)) & !1;
+            loop {
+                if lambda_idx[i + 1] != NN {
+                    den ^= alpha_to(mod_nn(lambda_idx[i + 1] + i * root[j]));
+                }
+                if i < 2 {
+                    break;
+                }
+                i -= 2;
+            }
+
+            if den == 0 {
+                return Err(DecodeError::CrcMismatch);
+            }
+            if num1 != 0 {
+                data[loc[j]] ^= alpha_to(mod_nn(
+                    usize::from(index_of(num1)) + usize::from(index_of(num2)) + NN
+                        - usize::from(index_of(den)),
+                ));
+            }
+        }
+
+        Ok(count)
     }
 
-    #[cfg(test)]
     fn encode_parity(message: &[u8]) -> [u8; PARITY_LEN] {
         let mut parity = [0u8; PARITY_LEN];
 
@@ -566,17 +873,18 @@ pub(crate) mod reed_solomon {
         }
 
         #[test]
-        fn shortened_rejects_errors() {
+        fn shortened_corrects_errors() {
             let message: Vec<u8> = (0..160).collect();
             let mut encoded = encode_shortened(&message, 1);
             encoded[3] ^= 0x55;
 
-            let err = match decode_shortened(&encoded, 1) {
-                Ok(_) => panic!("damaged RS codeword should fail"),
-                Err(err) => err,
+            let decoded = match decode_shortened(&encoded, 1) {
+                Ok(decoded) => decoded,
+                Err(err) => panic!("damaged RS codeword should be corrected: {err}"),
             };
 
-            assert!(matches!(err, DecodeError::CrcMismatch));
+            assert_eq!(decoded.message, message);
+            assert!(decoded.corrected_errors > 0);
         }
     }
 }

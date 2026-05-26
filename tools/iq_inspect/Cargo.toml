@@ -1,22 +1,18 @@
 [package]
-name = "decode_file"
+name = "iq_inspect"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Offline WAV-to-frames decoding tool for OpenHoshimi"
+description = "IQ WAV spectral and constellation inspector for OpenHoshimi"
 
 [[bin]]
-name = "decode_file"
+name = "iq_inspect"
 path = "src/main.rs"
 
 [dependencies]
 openhoshimi-core = { workspace = true }
-openhoshimi-dsp = { workspace = true }
-openhoshimi-codec = { workspace = true }
-openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
-openhoshimi-runtime = { workspace = true }
 clap = { workspace = true }

@@ -1,0 +1,48 @@
+# StratoSat TK-1 satellite definition.
+#
+# Reference: https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#            https://db.satnogs.org/satellite/57167
+#
+# Russian 3U CubeSat developed by Sirius University and StratoNautica,
+# launched 2023-06-27 on Soyuz-2.1b alongside Geoscan-Edelweiss. Carries
+# an amateur 9k6 GMSK telemetry beacon on 435.4745 MHz with classical
+# AX.25 framing. The bit-stream is NRZ-I encoded after the GMSK modem
+# and pre-scrambled with the G3RUH self-synchronising descrambler, the
+# common combination used by KISS / soundmodem-compatible TNCs.
+#
+# Telemetry interpretation is intentionally omitted here: the StratoSat
+# beacon payload format is mission-specific and is not yet wired up in
+# this crate. The decode chain stops at the AX.25 codec, surfacing the
+# unstuffed + FCS-validated payload bytes for downstream handling.
+
+[satellite]
+name = "StratoSat TK-1"
+aliases = ["STRATOSAT-TK-1", "STRATOSAT TK-1", "STRATOSAT TK1", "RS52S"]
+norad_id = 57167
+
+[[downlink]]
+label = "9k6 GMSK AX.25 telemetry beacon"
+freq_hz = 435_474_500
+modulation = "GMSK"
+baudrate = 9600
+framing = "AX25"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+# Standard amateur GMSK at h = 0.5 and BT = 0.5.
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = -450_000.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.descrambler]
+kind = "g3ruh"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"

@@ -1,0 +1,56 @@
+# Hyacinth-1 / 风信子一号 satellite definition.
+#
+# Reference: https://hyacinth.satellites.ac.cn/
+#            https://amsat-uk.org/satellites/upcoming/
+#
+# Educational CubeSat from the HyacinthSat amateur-radio team. Pre-launch
+# at the time of this entry; downlink parameters below are validated
+# against the project's reference IQ recording (see
+# `Custom_Signal/IQ_Custorm_*.wav`), which transmits a 4800 bd GMSK
+# beacon at 435.400 MHz with a 32-bit 0x55 preamble, the CCSDS attached
+# sync marker 0x1ACFFC1D, and a fixed 61-byte payload immediately
+# following the ASM. Bits are emitted MSB-first within each byte and the
+# stream is neither line-coded nor scrambled.
+#
+# `norad_id = 0` is a placeholder until the satellite launches and
+# receives a catalog number; update it post-launch.
+#
+# Telemetry layout is intentionally omitted: the on-orbit payload format
+# has not been published yet. The decode chain stops at the CCSDS framer,
+# surfacing the 61-byte raw payload for downstream inspection.
+
+[satellite]
+name = "Hyacinth-1"
+aliases = ["HyacinthSat", "风信子一号", "Fengxinzi-1"]
+norad_id = 0
+
+[[downlink]]
+label = "4k8 GMSK telemetry beacon"
+freq_hz = 435_400_000
+modulation = "GMSK"
+baudrate = 4800
+framing = "CCSDS"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+# Standard GMSK at modulation index h = 0.5 with Gaussian BT = 0.5.
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.framer]
+kind = "syncword"
+# CCSDS attached sync marker 0x1ACFFC1D, MSB-first.
+syncword = "00011010110011111111110000011101"
+# Tolerate up to 2 bit errors in the 32-bit ASM (matches the Python
+# reference decoder used to validate this definition).
+threshold = 2
+# Fixed 61-byte payload immediately follows the ASM.
+payload_bits = 488
+
+[downlink.codec]
+kind = "ccsds"

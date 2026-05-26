@@ -138,6 +138,9 @@ pub enum ModemDef {
         /// Modulation index.
         #[serde(default)]
         modulation_index: Option<f32>,
+        /// Frequency offset correction in Hz.
+        #[serde(default)]
+        frequency_offset_hz: f32,
         /// Gaussian BT product for GFSK/GMSK.
         #[serde(default)]
         gaussian_bt: Option<f32>,
@@ -147,17 +150,51 @@ pub enum ModemDef {
         /// Invert hard symbol decisions.
         #[serde(default)]
         invert: bool,
+        /// Swap I and Q before demodulation.
+        #[serde(default)]
+        swap_iq: bool,
     },
     /// Linear phase modulation over IQ.
     Linear {
         /// Linear modulation mode.
         mode: LinearModeDef,
+        /// Frequency offset correction in Hz, applied before symbol slicing.
+        #[serde(default)]
+        frequency_offset_hz: f32,
         /// Decode differential encoding after hard slicing.
         #[serde(default)]
         differential: bool,
         /// Invert hard symbol decisions.
         #[serde(default)]
         invert: bool,
+        /// Swap I and Q before demodulation.
+        #[serde(default)]
+        swap_iq: bool,
+        /// Closed-loop carrier tracker bandwidth normalized to the symbol
+        /// rate. `0.0` keeps the static frequency correction only.
+        #[serde(default)]
+        carrier_loop_bandwidth: f32,
+        /// Frequency-locked loop bandwidth normalized to the symbol rate.
+        /// Drives a Kay-style cross-product discriminator on squared symbols
+        /// for wide pull-in over Doppler. `0.0` disables the FLL and leaves
+        /// only the phase-locked Costas tracker active.
+        #[serde(default)]
+        frequency_loop_bandwidth: f32,
+        /// Maximum absolute offset the NCO is allowed to slew from the
+        /// static `frequency_offset_hz` baseline, in Hz. `0.0` selects a
+        /// conservative default of one symbol rate. Increase this for LEO
+        /// passes whose Doppler swing exceeds the default.
+        #[serde(default)]
+        nco_max_offset_hz: f32,
+        /// Root-raised-cosine matched filter roll-off factor in `(0.0, 1.0]`.
+        /// `0.0` disables matched filtering and falls back to a boxcar
+        /// integrate-and-dump symbol filter.
+        #[serde(default)]
+        matched_filter_rolloff: f32,
+        /// Matched filter span in symbol periods. Used only when
+        /// `matched_filter_rolloff > 0`. `0` selects a default (six symbols).
+        #[serde(default)]
+        matched_filter_span_symbols: usize,
     },
     /// LoRa modem placeholder.
     Lora {
@@ -246,6 +283,15 @@ pub enum FramerDef {
         /// Number of payload bits to collect after syncword detection.
         payload_bits: usize,
     },
+    /// GOMspace AX100 ASM-prefixed framing. Hunts the 32-bit attached sync
+    /// marker `0x930b_51de`, then emits a fixed 258-byte (3-byte Golay header
+    /// plus 255-byte CCSDS-randomised RS codeword) payload that the AX100
+    /// codec decodes.
+    Ax100Asm {
+        /// Maximum number of bit errors allowed in the 32-bit ASM.
+        #[serde(default = "default_ax100_asm_threshold")]
+        threshold: usize,
+    },
 }
 
 /// Forward-error-correction stage configuration.
@@ -306,6 +352,24 @@ pub struct TelemetrySchemaDef {
 }
 
 /// One telemetry field's location and decoding rule inside a frame.
+///
+/// A field may be addressed in two ways:
+///
+/// * **Byte-level** by setting [`offset`](Self::offset) and
+///   [`length`](Self::length); the raw value is the unsigned integer formed
+///   from those bytes in the chosen [`endian`](Self::endian) order.
+/// * **Bit-level** by setting [`bit_offset`](Self::bit_offset) and
+///   [`bit_length`](Self::bit_length); the payload is treated as an
+///   MSB-first bit stream (bit 0 of byte 0 is the most significant bit) and
+///   `bit_length` bits are extracted starting at `bit_offset`. The byte
+///   `endian` is ignored for bit-level fields.
+///
+/// The two modes are mutually exclusive. Bit-level addressing is required
+/// for densely packed schemas like FUNcube-1's RealTimeFC1 frame.
+///
+/// Calibration of the raw integer `r` is
+/// `engineering = scale * r^power + bias`, where `power` defaults to `1`
+/// (a plain linear `scale * r + bias`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryFieldDef {
     /// Short identifier (e.g. `"bat_voltage"`).
@@ -314,23 +378,41 @@ pub struct TelemetryFieldDef {
     /// Group/category the field belongs to (e.g. `"eps"`).
     #[serde(deserialize_with = "required")]
     pub group: String,
-    /// Byte offset from the start of the frame payload.
-    #[serde(deserialize_with = "required")]
-    pub offset: usize,
-    /// Length of the raw field in bytes.
-    #[serde(deserialize_with = "required")]
-    pub length: usize,
+    /// Byte offset from the start of the frame payload, when addressing
+    /// the field byte-by-byte. Mutually exclusive with
+    /// [`bit_offset`](Self::bit_offset).
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Length of the raw field in bytes. Mutually exclusive with
+    /// [`bit_length`](Self::bit_length).
+    #[serde(default)]
+    pub length: Option<usize>,
+    /// Bit offset from the start of the frame payload, when addressing
+    /// the field at sub-byte granularity. Mutually exclusive with
+    /// [`offset`](Self::offset).
+    #[serde(default)]
+    pub bit_offset: Option<usize>,
+    /// Length of the raw field in bits, up to 64. Mutually exclusive with
+    /// [`length`](Self::length).
+    #[serde(default)]
+    pub bit_length: Option<usize>,
     /// Byte order of the raw integer (`"big"` or `"little"`).
     /// Defaults to big-endian, matching the AMSAT/CCSDS convention.
+    /// Ignored for bit-level fields, which are always assembled MSB-first.
     #[serde(default = "default_endian")]
     pub endian: Endian,
-    /// Multiplicative scale: `engineering = raw * scale + bias`.
+    /// Multiplicative scale: `engineering = scale * raw^power + bias`.
     /// Defaults to `1.0`.
     #[serde(default = "default_scale")]
     pub scale: f64,
-    /// Additive bias applied after `scale`. Defaults to `0.0`.
+    /// Additive bias applied after the scale and power. Defaults to `0.0`.
     #[serde(default)]
     pub bias: f64,
+    /// Power exponent applied to the raw value before `scale`. Defaults to
+    /// `1.0` (plain linear). Used by FUNcube-1 RF-power telemetry which is
+    /// calibrated as `5e-3 * raw^2.0629`.
+    #[serde(default = "default_power")]
+    pub power: f64,
     /// Engineering unit (`"V"`, `"C"`, ...), if any.
     #[serde(default)]
     pub unit: Option<String>,
@@ -360,6 +442,10 @@ fn default_scale() -> f64 {
     1.0
 }
 
+fn default_power() -> f64 {
+    1.0
+}
+
 fn default_afsk_mark_hz() -> f32 {
     1200.0
 }
@@ -370,6 +456,10 @@ fn default_afsk_space_hz() -> f32 {
 
 fn default_interleave() -> usize {
     1
+}
+
+fn default_ax100_asm_threshold() -> usize {
+    4
 }
 
 fn required<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -449,6 +539,59 @@ fn validate(def: &SatelliteDefinition) -> Result<(), ConfigError> {
         }
         validate_downlink_pipeline(d)?;
     }
+    for (name, schema) in &def.telemetry {
+        validate_telemetry_schema(name, schema)?;
+    }
+    Ok(())
+}
+
+fn validate_telemetry_schema(name: &str, schema: &TelemetrySchemaDef) -> Result<(), ConfigError> {
+    for field in &schema.fields {
+        let has_byte = field.offset.is_some() || field.length.is_some();
+        let has_bit = field.bit_offset.is_some() || field.bit_length.is_some();
+        if has_byte && has_bit {
+            return Err(ConfigError::InvalidValue {
+                field: format!("telemetry.{name}.field[{}]", field.name),
+                reason: "must use either byte-level (offset/length) or bit-level (bit_offset/bit_length) addressing, not both".into(),
+            });
+        }
+        if has_byte {
+            if field.offset.is_none() || field.length.is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("telemetry.{name}.field[{}]", field.name),
+                    reason: "byte-level addressing requires both offset and length".into(),
+                });
+            }
+            if let Some(length) = field.length {
+                if length == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("telemetry.{name}.field[{}].length", field.name),
+                        reason: "must be > 0".into(),
+                    });
+                }
+            }
+        } else if has_bit {
+            if field.bit_offset.is_none() || field.bit_length.is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("telemetry.{name}.field[{}]", field.name),
+                    reason: "bit-level addressing requires both bit_offset and bit_length".into(),
+                });
+            }
+            if let Some(length) = field.bit_length {
+                if length == 0 || length > 64 {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("telemetry.{name}.field[{}].bit_length", field.name),
+                        reason: "must be in 1..=64".into(),
+                    });
+                }
+            }
+        } else {
+            return Err(ConfigError::InvalidValue {
+                field: format!("telemetry.{name}.field[{}]", field.name),
+                reason: "must specify either byte-level or bit-level addressing".into(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -477,6 +620,7 @@ fn validate_modem(label: &str, modem: &ModemDef) -> Result<(), ConfigError> {
         }
         ModemDef::Cpm {
             modulation_index,
+            frequency_offset_hz,
             gaussian_bt,
             ..
         } => {
@@ -486,6 +630,12 @@ fn validate_modem(label: &str, modem: &ModemDef) -> Result<(), ConfigError> {
                     "must be > 0",
                 );
             }
+            if !frequency_offset_hz.is_finite() {
+                return invalid_value(
+                    format!("downlink[{label}].modem.frequency_offset_hz"),
+                    "must be finite",
+                );
+            }
             if gaussian_bt.is_some_and(|value| value <= 0.0) {
                 return invalid_value(
                     format!("downlink[{label}].modem.gaussian_bt"),
@@ -493,7 +643,27 @@ fn validate_modem(label: &str, modem: &ModemDef) -> Result<(), ConfigError> {
                 );
             }
         }
-        ModemDef::Linear { .. } => {}
+        ModemDef::Linear {
+            frequency_offset_hz,
+            matched_filter_rolloff,
+            ..
+        } => {
+            if !frequency_offset_hz.is_finite() {
+                return invalid_value(
+                    format!("downlink[{label}].modem.frequency_offset_hz"),
+                    "must be finite",
+                );
+            }
+            if !matched_filter_rolloff.is_finite()
+                || *matched_filter_rolloff < 0.0
+                || *matched_filter_rolloff > 1.0
+            {
+                return invalid_value(
+                    format!("downlink[{label}].modem.matched_filter_rolloff"),
+                    "must be in [0.0, 1.0]",
+                );
+            }
+        }
         ModemDef::Lora {
             spreading_factor,
             bandwidth_hz,
@@ -556,6 +726,14 @@ fn validate_framer(label: &str, framer: &FramerDef) -> Result<(), ConfigError> {
                 return invalid_value(
                     format!("downlink[{label}].framer.payload_bits"),
                     "must be > 0",
+                );
+            }
+        }
+        FramerDef::Ax100Asm { threshold } => {
+            if *threshold > 32 {
+                return invalid_value(
+                    format!("downlink[{label}].framer.threshold"),
+                    "must be <= 32",
                 );
             }
         }
@@ -638,7 +816,9 @@ telemetry_schema = "funcube_1"
 [downlink.modem]
 kind = "linear"
 mode = "dbpsk"
+frequency_offset_hz = -6000.0
 differential = true
+swap_iq = true
 
 [downlink.framer]
 kind = "ao40"
@@ -677,12 +857,26 @@ warn_above = 8.4
         match &def.downlinks[0].modem {
             Some(ModemDef::Linear {
                 mode,
+                frequency_offset_hz,
                 differential,
                 invert,
+                swap_iq,
+                carrier_loop_bandwidth,
+                frequency_loop_bandwidth,
+                nco_max_offset_hz,
+                matched_filter_rolloff,
+                matched_filter_span_symbols,
             }) => {
                 assert_eq!(*mode, LinearModeDef::Dbpsk);
+                assert_eq!(*frequency_offset_hz, -6000.0);
                 assert!(*differential);
                 assert!(!*invert);
+                assert!(*swap_iq);
+                assert_eq!(*carrier_loop_bandwidth, 0.0);
+                assert_eq!(*frequency_loop_bandwidth, 0.0);
+                assert_eq!(*nco_max_offset_hz, 0.0);
+                assert_eq!(*matched_filter_rolloff, 0.0);
+                assert_eq!(*matched_filter_span_symbols, 0);
             }
             other => panic!("expected linear modem, got {other:?}"),
         }

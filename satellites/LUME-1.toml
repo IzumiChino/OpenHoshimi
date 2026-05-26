@@ -1,0 +1,52 @@
+# LUME-1 satellite definition.
+#
+# Reference: https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#       https://nanosats.eu/sat/lume-1
+#https://db.satnogs.org/satellite/43804
+#
+# 1U CubeSat from the University of Vigo (Spain), launched 2018-12-03
+# on PSLV-C43 alongside SNUGLITE. IARU-coordinated. Beacon downlink is
+# 9600 bd GMSK on 437.250 MHz, using a GOMspace NanoCom AX100 transceiver
+# in ASM+Golay mode: a 32-bit attached sync marker, followed by a
+# Golay(24,12) header carrying the encoded payload length, then a
+# CCSDS-randomized shortened RS(255,223) codeword.
+#
+# Telemetry interpretation is intentionally omitted here: the LUME-1
+# beacon payload format is mission-specific and is not yet wired up in
+# this crate. The decode chain stops at the AX100 codec, surfacing the
+# de-randomized + RS-corrected payload bytes for downstream handling.
+
+[satellite]
+name = "LUME-1"
+aliases = ["LUME1", "LUME 1"]
+norad_id = 43804
+
+[[downlink]]
+label = "9k6 GMSK telemetry beacon"
+freq_hz = 437_250_000
+modulation = "GMSK"
+baudrate = 9600
+framing = "GOMSPACE_AX100"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.framer]
+kind = "ax100_asm"
+# Conservative ASM correlation threshold: tolerate up to 4 bit errors in
+# the 32-bit syncword.
+threshold = 4
+
+[downlink.fec]
+kind = "ax100"
+
+[downlink.codec]
+kind = "gomspace_ax100"
+mode = "asm_golay"

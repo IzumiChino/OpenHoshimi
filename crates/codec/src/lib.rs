@@ -12,7 +12,7 @@ pub mod ax100;
 pub mod ax25;
 pub mod fec;
 
-pub use ao40::{ao40_syncword_bits, Ao40FecDecoder, Ao40Frame};
+pub use ao40::{ao40_syncword_bits, Ao40FecDecoder, Ao40FecEncoder, Ao40Frame};
 pub use ax100::{ax100_syncword, Ax100Decoder, Ax100Flags, Ax100Frame, Ax100Mode};
 pub use ax25::{Ax25Decoder, Ax25Frame, Callsign};
 pub use fec::{ReedSolomon, Viterbi};

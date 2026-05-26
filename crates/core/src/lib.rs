@@ -122,6 +122,12 @@ pub trait InputSource: Send {
     /// Human-readable description of the source, e.g. `"WAV file
     /// recording.wav (48000 Hz, 16-bit, mono)"`.
     fn description(&self) -> &str;
+
+    /// Total number of logical samples available from this source, if
+    /// known.
+    fn total_samples(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Provides a stream of complex IQ samples from any source.
@@ -137,6 +143,12 @@ pub trait IqSource: Send {
 
     /// Human-readable description of the source.
     fn description(&self) -> &str;
+
+    /// Total number of logical IQ samples available from this source, if
+    /// known.
+    fn total_samples(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A complete decoded frame, after framing but before telemetry parsing.
