@@ -14,4 +14,5 @@ openhoshimi-dsp = { workspace = true }
 openhoshimi-codec = { workspace = true }
 openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
+rayon = { workspace = true }
 

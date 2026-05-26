@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 use openhoshimi_codec::{
     ax100_syncword, Ao40FecDecoder, Ax100Decoder, Ax100Mode, Ax25Decoder, Ax25Frame, Callsign,
 };
@@ -271,96 +273,158 @@ pub fn search_linear_iq_alignment_scored(
     if symbol_span == 0 || prefix.len() < symbol_span * 2 {
         return None;
     }
-    let skip_step = (symbol_span / 8).max(1);
+    // Two-stage sample-skip search: a coarse half-symbol sweep to locate
+    // the basin, then a fine eighth-symbol sweep around the best coarse
+    // hit.  This is ~2x cheaper than the previous single-stage span/8
+    // sweep while keeping the same final resolution.
+    let coarse_step = (symbol_span / 2).max(1);
+    let fine_step = (symbol_span / 8).max(1);
+    let frequency_offset_hz = *frequency_offset_hz;
 
-    let mut best_hint = None;
-    let mut best_frames = 0usize;
-    let mut best_distance: Option<usize> = None;
-    for candidate_differential in [*differential, !*differential] {
-        for candidate_swap_iq in [*swap_iq, !*swap_iq] {
-            for candidate_invert in [*invert, !*invert] {
-                let mut trial = downlink.clone();
-                // Sync vector lives at col=0 (one symbol per 80), so it is
-                // unaffected by adjacent-symbol ISI and a matched filter is
-                // not needed for alignment search. Skipping it keeps the
-                // O(N_polarity * N_skip) prefix sweep tractable.
-                if let Some(ModemDef::Linear {
-                    differential,
-                    invert,
-                    swap_iq: trial_swap_iq,
-                    frequency_loop_bandwidth,
-                    matched_filter_rolloff,
-                    matched_filter_span_symbols,
-                    ..
-                }) = trial.modem.as_mut()
-                {
-                    *differential = candidate_differential;
-                    *invert = candidate_invert;
-                    *trial_swap_iq = candidate_swap_iq;
-                    // FLL would slew the NCO during trial scoring and hide
-                    // alignment at the candidate offset; disable it here so
-                    // the per-offset frame count reflects pure Costas lock.
-                    *frequency_loop_bandwidth = 0.0;
-                    *matched_filter_rolloff = 0.0;
-                    *matched_filter_span_symbols = 0;
-                }
+    // The 8 polarity combinations (differential x swap_iq x invert) are
+    // independent: each builds its own BitPipeline and reads the prefix
+    // without touching shared state, so the sweep parallelises cleanly.
+    let combos: [(bool, bool, bool); 8] = [
+        (*differential, *swap_iq, *invert),
+        (*differential, *swap_iq, !*invert),
+        (*differential, !*swap_iq, *invert),
+        (*differential, !*swap_iq, !*invert),
+        (!*differential, *swap_iq, *invert),
+        (!*differential, *swap_iq, !*invert),
+        (!*differential, !*swap_iq, *invert),
+        (!*differential, !*swap_iq, !*invert),
+    ];
 
-                let mut sample_skip = 0usize;
-                while sample_skip < symbol_span {
-                    if sample_skip >= prefix.len() {
-                        break;
-                    }
-                    let mut pipeline = match BitPipeline::<IqSample>::new(&trial) {
-                        Ok(pipeline) => pipeline,
-                        Err(_) => {
-                            sample_skip += skip_step;
-                            continue;
-                        }
-                    };
-                    let configured = pipeline
-                        .configure_demodulator(
-                            &trial,
-                            sample_rate,
-                            *frequency_offset_hz + tuning_offset_hz,
-                        )
-                        .is_ok();
-                    if !configured {
-                        sample_skip += skip_step;
-                        continue;
-                    }
-                    let frames = pipeline.push_samples(&prefix[sample_skip..]);
-                    let frame_count = frames.len();
-                    let distance = pipeline.best_sync_distance();
-                    let better = match (frame_count, best_frames) {
-                        (current, best) if current > best => true,
-                        (current, best) if current == best => match (distance, best_distance) {
-                            (Some(current), Some(best)) => current < best,
-                            (Some(_), None) => true,
-                            _ => false,
-                        },
-                        _ => false,
-                    };
-                    if better {
-                        best_frames = frame_count;
-                        best_distance = distance;
-                        best_hint = Some(IqAlignmentHint {
-                            sample_skip,
-                            differential: candidate_differential,
-                            invert: candidate_invert,
-                            swap_iq: candidate_swap_iq,
-                        });
-                    }
-                    sample_skip += skip_step;
+    let per_combo = |&(candidate_differential, candidate_swap_iq, candidate_invert): &(
+        bool,
+        bool,
+        bool,
+    )|
+     -> Option<IqAlignmentSearchResult> {
+        let mut trial = downlink.clone();
+        // Sync vector lives at col=0 (one symbol per 80), so it is
+        // unaffected by adjacent-symbol ISI and a matched filter is
+        // not needed for alignment search. Skipping it keeps the
+        // O(N_polarity * N_skip) prefix sweep tractable.
+        if let Some(ModemDef::Linear {
+            differential,
+            invert,
+            swap_iq: trial_swap_iq,
+            frequency_loop_bandwidth,
+            matched_filter_rolloff,
+            matched_filter_span_symbols,
+            ..
+        }) = trial.modem.as_mut()
+        {
+            *differential = candidate_differential;
+            *invert = candidate_invert;
+            *trial_swap_iq = candidate_swap_iq;
+            // FLL would slew the NCO during trial scoring and hide
+            // alignment at the candidate offset; disable it here so
+            // the per-offset frame count reflects pure Costas lock.
+            *frequency_loop_bandwidth = 0.0;
+            *matched_filter_rolloff = 0.0;
+            *matched_filter_span_symbols = 0;
+        }
+
+        let try_skip = |sample_skip: usize| -> Option<(usize, Option<usize>)> {
+            if sample_skip >= prefix.len() {
+                return None;
+            }
+            let mut pipeline = BitPipeline::<IqSample>::new(&trial).ok()?;
+            pipeline
+                .configure_demodulator(&trial, sample_rate, frequency_offset_hz + tuning_offset_hz)
+                .ok()?;
+            let frames = pipeline.push_samples(&prefix[sample_skip..]);
+            Some((frames.len(), pipeline.best_sync_distance()))
+        };
+
+        // Coarse pass.
+        let mut best_skip = 0usize;
+        let mut best_frames = 0usize;
+        let mut best_distance: Option<usize> = None;
+        let mut sample_skip = 0usize;
+        while sample_skip < symbol_span {
+            if let Some((frame_count, distance)) = try_skip(sample_skip) {
+                if score_better(best_frames, best_distance, frame_count, distance) {
+                    best_frames = frame_count;
+                    best_distance = distance;
+                    best_skip = sample_skip;
                 }
             }
+            sample_skip += coarse_step;
         }
-    }
 
-    best_hint.map(|hint| IqAlignmentSearchResult {
-        hint,
-        frames: best_frames,
-        sync_distance: best_distance,
-    })
+        // Fine pass around the best coarse skip.
+        if fine_step < coarse_step {
+            let lo = best_skip.saturating_sub(coarse_step);
+            let hi = (best_skip + coarse_step).min(symbol_span);
+            let mut sample_skip = lo;
+            while sample_skip < hi {
+                // Skip points the coarse pass already evaluated.
+                if (sample_skip - lo) % coarse_step != 0 || sample_skip != best_skip {
+                    if let Some((frame_count, distance)) = try_skip(sample_skip) {
+                        if score_better(best_frames, best_distance, frame_count, distance) {
+                            best_frames = frame_count;
+                            best_distance = distance;
+                            best_skip = sample_skip;
+                        }
+                    }
+                }
+                sample_skip += fine_step;
+            }
+        }
+
+        if best_frames == 0 && best_distance.is_none() {
+            return None;
+        }
+        Some(IqAlignmentSearchResult {
+            hint: IqAlignmentHint {
+                sample_skip: best_skip,
+                differential: candidate_differential,
+                invert: candidate_invert,
+                swap_iq: candidate_swap_iq,
+            },
+            frames: best_frames,
+            sync_distance: best_distance,
+        })
+    };
+
+    combos
+        .par_iter()
+        .filter_map(per_combo)
+        .reduce_with(|prev, next| {
+            if score_better(
+                prev.frames,
+                prev.sync_distance,
+                next.frames,
+                next.sync_distance,
+            ) {
+                next
+            } else {
+                prev
+            }
+        })
+}
+
+/// Strictly-better alignment score comparator.
+///
+/// Higher frame count wins; on a tie, lower sync distance wins.
+fn score_better(
+    best_frames: usize,
+    best_distance: Option<usize>,
+    frame_count: usize,
+    distance: Option<usize>,
+) -> bool {
+    match frame_count.cmp(&best_frames) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => match (distance, best_distance) {
+            (Some(current), Some(best)) => current < best,
+            (Some(_), None) => true,
+            _ => false,
+        },
+        std::cmp::Ordering::Less => false,
+    }
 }
 
 /// A scored linear IQ alignment result.
@@ -669,6 +733,16 @@ pub fn prepare_linear_iq_setup_scored_with_progress(
             ) {
                 best_distance = result.sync_distance;
                 best = Some((setup, result.frames));
+            }
+            // High-confidence early exit: two-or-more frames with the
+            // best possible sync distance (zero, or unknown for framers
+            // that don't expose it like SyncwordFramer/HdlcFramer)
+            // means this candidate is almost certainly the right one.
+            // Keep scanning only if this candidate looks ambiguous.
+            let confident = result.frames >= 2 && matches!(result.sync_distance, Some(0) | None);
+            if confident {
+                progress(total, total);
+                return best;
             }
         }
         progress(idx + 1, total);

@@ -49,6 +49,14 @@ const DEFAULT_WATERFALL_MIN_DB: f32 = -90.0;
 const DEFAULT_WATERFALL_MAX_DB: f32 = -10.0;
 const WATERFALL_DB_FLOOR: f32 = -160.0;
 const WATERFALL_DB_CEIL: f32 = 20.0;
+/// Linear-IQ alignment scorer prefix length, in seconds.  The cached
+/// prefix held for the decoder run remains the full 8 s (no samples
+/// dropped); only the scorer's per-trial sweep is shortened.  Two
+/// seconds is enough for the SyncwordFramer to lock at typical baud
+/// rates while keeping the polarity-and-skip search tractable.  If
+/// scoring returns zero frames against the short slice we fall back
+/// to the full prefix.
+const ALIGNMENT_SCORER_PREFIX_SEC: u32 = 2;
 
 /// Application entry point.
 fn main() -> eframe::Result<()> {
@@ -2239,24 +2247,39 @@ fn run_alignment_thread(
         }
     };
 
+    let scorer_prefix_len =
+        (sample_rate as usize * ALIGNMENT_SCORER_PREFIX_SEC as usize).min(prefix.len());
     let mut announced = false;
-    let scored = {
+    let mut score_with = |samples: &[IqSample]| {
         let events_inner = events.clone();
-        prepare_linear_iq_setup_scored_with_progress(
+        let mut local_announced = announced;
+        let result = prepare_linear_iq_setup_scored_with_progress(
             &downlink,
             sample_rate,
-            &prefix,
+            samples,
             tuning_offset_hz,
             &mut |current, total| {
-                if !announced {
-                    announced = true;
+                if !local_announced {
+                    local_announced = true;
                     let _ = events_inner.send(RxEvent::AlignmentStarted { total });
                 } else {
                     let _ = events_inner.send(RxEvent::AlignmentProgress { current });
                 }
             },
-        )
+        );
+        announced = local_announced;
+        result
     };
+
+    let mut scored = score_with(&prefix[..scorer_prefix_len]);
+    if matches!(&scored, Some((_, frames)) if *frames == 0) && scorer_prefix_len < prefix.len() {
+        let _ = events.send(RxEvent::Dropped(format!(
+            "alignment scorer found 0 frames in {} s slice; retrying with full {} s prefix",
+            ALIGNMENT_SCORER_PREFIX_SEC,
+            prefix.len() / sample_rate.max(1) as usize,
+        )));
+        scored = score_with(&prefix);
+    }
 
     let (setup, frames) = match scored {
         Some(value) => value,
