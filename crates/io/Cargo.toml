@@ -10,7 +10,6 @@ description = "Input sources (WAV, IQ files, soundcard) for OpenHoshimi"
 
 [dependencies]
 openhoshimi-core = { workspace = true }
-hound = { workspace = true }
 cpal = { workspace = true }
 lewton = { workspace = true }
 ogg = { workspace = true }

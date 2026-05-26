@@ -23,7 +23,7 @@ use openhoshimi_core::{
 use openhoshimi_io::{OggSource, SoundcardSource, WavIqSource, WavSource};
 use openhoshimi_runtime::pipeline::{
     can_build_downlink, format_hex, format_timestamp, infer_tuning_offset_hz, input_kind_for,
-    is_ao40_fec_downlink, prepare_linear_iq_setup_scored,
+    is_ao40_fec_downlink, is_linear_iq_modem, prepare_linear_iq_setup_scored,
     prepare_linear_iq_setup_scored_with_progress, BitPipeline, DecodedFrame, InputKind,
     SoftAo40Pipeline,
 };
@@ -982,6 +982,7 @@ impl OpenHoshimiApp {
         ScrollArea::vertical()
             .id_salt("satellites_scroll")
             .auto_shrink([false, false])
+            .max_height(ui.available_height())
             .show(ui, |ui| {
                 let filter = self.filter.to_ascii_lowercase();
                 if self.satellites.is_empty() {
@@ -1311,9 +1312,11 @@ impl OpenHoshimiApp {
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 ui.set_min_height(96.0);
+                ui.set_max_height(160.0);
                 ScrollArea::vertical()
                     .id_salt("hex_dump_scroll")
                     .auto_shrink([false, false])
+                    .max_height(ui.available_height())
                     .show(ui, |ui| {
                         if raw.is_empty() {
                             label_muted(ui, "-- no frame selected --");
@@ -1363,6 +1366,7 @@ impl OpenHoshimiApp {
         ScrollArea::vertical()
             .id_salt("telemetry_scroll")
             .auto_shrink([false, false])
+            .max_height(ui.available_height())
             .show(ui, |ui| {
                 if let Some(row) = self.selected_frame_row() {
                     let mut groups: BTreeMap<&str, Vec<&TelemetryField>> = BTreeMap::new();
@@ -1442,6 +1446,7 @@ impl OpenHoshimiApp {
                 ScrollArea::vertical()
                     .id_salt("diagnostics_scroll")
                     .auto_shrink([false, false])
+                    .max_height(ui.available_height())
                     .show(ui, |ui| {
                         if self.diagnostics.is_empty() {
                             label_muted(ui, "-- no diagnostics --");
@@ -2118,6 +2123,28 @@ fn run_alignment_thread(
         }
     };
     let sample_rate = source.sample_rate();
+
+    // Non-linear modems (CPM/GMSK, AFSK, 4FSK, FM-audio) don't have a
+    // linear-IQ alignment grid — fall straight through to TOML defaults
+    // without reading the 8-second prefix or running the scorer.
+    if !is_linear_iq_modem(&downlink) {
+        let setup = openhoshimi_runtime::pipeline::LinearIqSetup {
+            downlink: downlink.clone(),
+            tuning_offset_hz,
+            sample_skip: 0,
+        };
+        let cached = CachedAlignment {
+            path,
+            sample_rate,
+            downlink_id,
+            prefix: Vec::new(),
+            setup,
+            frames: 0,
+        };
+        let _ = events.send(RxEvent::AlignmentReady(Box::new(cached)));
+        return;
+    }
+
     let prefix_len = sample_rate as usize * 8;
     let mut prefix = match read_iq_prefix(&mut source, prefix_len) {
         Ok(prefix) => prefix,

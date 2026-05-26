@@ -1304,6 +1304,16 @@ pub fn is_ao40_fec_downlink(downlink: &DownlinkDef) -> bool {
     matches!(codec_kind(downlink), Some(CodecKind::Ao40Fec))
 }
 
+/// Whether a downlink uses a linear-IQ modem (BPSK / QPSK / etc.).
+///
+/// Used by callers to decide whether running the linear-IQ alignment
+/// helpers ([`prepare_linear_iq_setup`] and friends) is worthwhile.
+/// Non-linear modems (CPM/GMSK, AFSK, 4FSK, FM-audio) skip alignment
+/// and run from TOML defaults.
+pub fn is_linear_iq_modem(downlink: &DownlinkDef) -> bool {
+    matches!(downlink.modem.as_ref(), Some(ModemDef::Linear { .. }))
+}
+
 /// Soft-decision IQ pipeline for AO-40 FEC downlinks.
 ///
 /// This pipeline mirrors [`BitPipeline`] but keeps per-bit confidence
