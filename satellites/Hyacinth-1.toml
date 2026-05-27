@@ -26,7 +26,7 @@ norad_id = 0
 
 [[downlink]]
 label = "4k8 GMSK telemetry beacon"
-freq_hz = 435_400_000
+freq_hz = 435_500_000
 modulation = "GMSK"
 baudrate = 4800
 framing = "CCSDS"
