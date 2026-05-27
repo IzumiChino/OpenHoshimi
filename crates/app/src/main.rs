@@ -23,7 +23,12 @@ use openhoshimi_core::satellite::{
 use openhoshimi_core::{
     Frame as CoreFrame, InputSource, IoError, IqSample, IqSource, TelemetryField, TelemetryValue,
 };
-use openhoshimi_io::{OggSource, SoundcardSource, WavIqSource, WavSource};
+use openhoshimi_dsp::estimate_audio_carrier;
+use openhoshimi_io::{
+    detect_audio_mode_auto, enumerate_input_devices, open_audio_source, read_audio_prefix,
+    read_iq_prefix, AudioMode as IoAudioMode, MonoIqSource, SoundcardDeviceInfo, SoundcardIqSource,
+    SoundcardSource, WavIqSource, WavSource,
+};
 use openhoshimi_runtime::pipeline::{
     can_build_downlink, estimate_cpm_iq_frequency_offset_hz, estimate_iq_frequency_offset_hz,
     format_hex, format_timestamp, infer_tuning_offset_hz, input_kind_for, is_ao40_fec_downlink,
@@ -106,6 +111,24 @@ struct OpenHoshimiApp {
     alignment_state: AlignmentState,
     cached_alignment: Option<CachedAlignment>,
     alignment_thread: Option<thread::JoinHandle<()>>,
+    /// Names of currently-known soundcard input devices.  Refreshed once
+    /// at startup and on demand from the input panel; empty entries mean
+    /// the cpal default host has no input devices.
+    soundcard_devices: Vec<SoundcardDeviceInfo>,
+    /// Name of the soundcard input device chosen by the user.  `None`
+    /// means "use whatever cpal reports as default" so a missing or
+    /// unselected device falls back to `SoundcardSource::open_default`.
+    selected_soundcard: Option<String>,
+    /// How the active WAV file should be interpreted by an IQ-family
+    /// downlink.  Auto sniffs the file and falls back to FM-discriminator
+    /// audio for mono / duplicate-stereo inputs; explicit Fm/Ssb force
+    /// that path even when the file looks like real IQ.
+    audio_mode: IoAudioMode,
+    /// Audio-band carrier frequency in Hz, used only when `audio_mode`
+    /// resolves to [`IoAudioMode::Ssb`].  The CPM IQ demodulator mixes
+    /// this carrier to baseband and the complex low-pass kills the
+    /// mirror sideband.
+    audio_carrier_hz: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +269,10 @@ impl OpenHoshimiApp {
             alignment_state: AlignmentState::Idle,
             cached_alignment: None,
             alignment_thread: None,
+            soundcard_devices: enumerate_input_devices(),
+            selected_soundcard: None,
+            audio_mode: IoAudioMode::Auto,
+            audio_carrier_hz: 0.0,
         };
         app.reload_satellites();
         app
@@ -340,13 +367,6 @@ impl OpenHoshimiApp {
             self.push_diagnostic(DiagnosticLevel::Error, self.status.clone());
             return;
         }
-        if matches!(self.input_mode, InputMode::Soundcard)
-            && input_kind_for(&selected) == Some(InputKind::Iq)
-        {
-            self.status = "selected downlink requires IQ WAV input".to_string();
-            self.push_diagnostic(DiagnosticLevel::Error, self.status.clone());
-            return;
-        }
         if matches!(self.input_mode, InputMode::WavFile) && self.input_path.is_none() {
             self.status = "no WAV file selected".to_string();
             self.push_diagnostic(DiagnosticLevel::Warn, self.status.clone());
@@ -358,9 +378,12 @@ impl OpenHoshimiApp {
         let input_mode = self.input_mode;
         let decode_pace = self.decode_pace;
         let input_path = self.input_path.clone();
+        let soundcard_device = self.selected_soundcard.clone();
         let selected_label = selected.label.clone();
         let tuning_offset_hz = self.tuning_offset_for_selected(&selected, input_path.as_deref());
         let cached_alignment = self.cached_alignment.clone();
+        let audio_mode = self.audio_mode;
+        let audio_carrier_hz = self.audio_carrier_hz;
         let thread = thread::spawn(move || {
             run_decode_thread(
                 satellite,
@@ -368,8 +391,11 @@ impl OpenHoshimiApp {
                 input_mode,
                 decode_pace,
                 input_path,
+                soundcard_device,
                 tuning_offset_hz,
                 cached_alignment,
+                audio_mode,
+                audio_carrier_hz,
                 events,
                 stop_rx,
             )
@@ -833,6 +859,9 @@ impl OpenHoshimiApp {
                     ui.selectable_value(&mut self.input_mode, InputMode::Soundcard, "Soundcard");
                     ui.selectable_value(&mut self.input_mode, InputMode::WavFile, "WAV file");
                 });
+            if matches!(self.input_mode, InputMode::Soundcard) {
+                self.soundcard_device_combo(ui);
+            }
             if matches!(self.input_mode, InputMode::WavFile)
                 && bracket_button(ui, "Open WAV...", 180.0).clicked()
             {
@@ -866,6 +895,52 @@ impl OpenHoshimiApp {
             );
             label_muted(ui, "Hz");
 
+            let audio_mode_enabled = matches!(self.input_mode, InputMode::WavFile)
+                && matches!(
+                    self.selected_downlink().and_then(input_kind_for),
+                    Some(InputKind::Iq)
+                );
+            label_muted(ui, "Audio:");
+            let prev_audio_mode = self.audio_mode;
+            ui.add_enabled_ui(audio_mode_enabled && !self.running, |ui| {
+                let label = match self.audio_mode {
+                    IoAudioMode::Auto => "Auto",
+                    IoAudioMode::Iq => "IQ",
+                    IoAudioMode::Fm => "FM",
+                    IoAudioMode::Ssb => "SSB",
+                };
+                egui::ComboBox::from_id_salt("audio_mode")
+                    .selected_text(label)
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.audio_mode, IoAudioMode::Auto, "Auto");
+                        ui.selectable_value(&mut self.audio_mode, IoAudioMode::Iq, "IQ");
+                        ui.selectable_value(&mut self.audio_mode, IoAudioMode::Fm, "FM");
+                        ui.selectable_value(&mut self.audio_mode, IoAudioMode::Ssb, "SSB");
+                    });
+            });
+            if prev_audio_mode != self.audio_mode && self.input_path.is_some() {
+                self.spawn_alignment();
+            }
+            if matches!(self.audio_mode, IoAudioMode::Ssb) {
+                label_muted(ui, "Carrier:");
+                ui.add_enabled_ui(audio_mode_enabled && !self.running, |ui| {
+                    ui.add_sized(
+                        [70.0, 22.0],
+                        egui::DragValue::new(&mut self.audio_carrier_hz)
+                            .speed(10.0)
+                            .range(0.0..=24_000.0)
+                            .suffix(" Hz"),
+                    );
+                });
+            }
+
+            let pace_enabled = matches!(self.input_mode, InputMode::WavFile);
+            label_muted(ui, "Pace:");
+            ui.add_enabled_ui(pace_enabled, |ui| {
+                ui.selectable_value(&mut self.decode_pace, DecodePace::Fast, "[Fast]");
+                ui.selectable_value(&mut self.decode_pace, DecodePace::Realtime, "[Realtime]");
+            });
             let can_start = !self.running && self.selected_downlink().is_some();
             ui.add_enabled_ui(can_start, |ui| {
                 if bracket_button(ui, "Start", 70.0).clicked() {
@@ -1430,23 +1505,6 @@ impl OpenHoshimiApp {
                             key_value(ui, "framing", &downlink.framing);
                             key_value(ui, "input", input_kind_label(input_kind_for(downlink)));
                         }
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            label_muted(ui, "pace  ");
-                            let pace_enabled = matches!(self.input_mode, InputMode::WavFile);
-                            ui.add_enabled_ui(pace_enabled, |ui| {
-                                ui.selectable_value(
-                                    &mut self.decode_pace,
-                                    DecodePace::Fast,
-                                    "[Fast]",
-                                );
-                                ui.selectable_value(
-                                    &mut self.decode_pace,
-                                    DecodePace::Realtime,
-                                    "[Realtime]",
-                                );
-                            });
-                        });
                     });
             });
     }
@@ -1527,6 +1585,22 @@ impl OpenHoshimiApp {
         if !matches!(input_kind_for(&downlink), Some(InputKind::Iq)) {
             return;
         }
+        if matches!(self.audio_mode, IoAudioMode::Fm | IoAudioMode::Ssb) {
+            return;
+        }
+        if matches!(self.audio_mode, IoAudioMode::Auto) {
+            // Auto resolves to Fm for mono / duplicate-stereo WAVs and to
+            // Ssb when the filename hints USB/LSB. Only Iq-resolved Auto
+            // needs an alignment pre-flight; otherwise unconditionally
+            // opening the file as stereo IQ surfaces a misleading
+            // "WAV IQ input requires at least 2 channels" error in the
+            // event log every time the user loads a real-audio recording.
+            match detect_audio_mode_auto(&path) {
+                Ok(IoAudioMode::Iq) => {}
+                Ok(_) => return,
+                Err(_) => return,
+            }
+        }
         let tuning_offset_hz = self.tuning_offset_for_selected(&downlink, Some(path.as_path()));
         let events = self.rx_sender.clone();
         let handle = thread::spawn(move || {
@@ -1539,6 +1613,69 @@ impl OpenHoshimiApp {
         match self.input_mode {
             InputMode::Soundcard => "soundcard",
             InputMode::WavFile => "wav file",
+        }
+    }
+
+    fn soundcard_device_label(&self) -> String {
+        match self.selected_soundcard.as_deref() {
+            Some(name) => name.to_string(),
+            None => "default".to_string(),
+        }
+    }
+
+    fn soundcard_device_combo(&mut self, ui: &mut egui::Ui) {
+        // Drop the selection if a previously-chosen device disappeared
+        // between refreshes (USB unplug, host switch).  This keeps the
+        // dropdown's `selected_text` consistent with the popup contents.
+        if let Some(name) = self.selected_soundcard.as_deref() {
+            if !self.soundcard_devices.iter().any(|d| d.name == name) {
+                self.selected_soundcard = None;
+            }
+        }
+        let label = self.soundcard_device_label();
+        egui::ComboBox::from_id_salt("soundcard_device")
+            .selected_text(label)
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.selected_soundcard, None, "default");
+                if self.soundcard_devices.is_empty() {
+                    ui.add_enabled(false, egui::Label::new("(no input devices)"));
+                } else {
+                    for device in &self.soundcard_devices {
+                        let mut label = device.name.clone();
+                        if device.is_default {
+                            label.push_str(" (default)");
+                        }
+                        ui.selectable_value(
+                            &mut self.selected_soundcard,
+                            Some(device.name.clone()),
+                            label,
+                        );
+                    }
+                }
+            });
+        if bracket_button(ui, "Refresh", 80.0).clicked() {
+            self.refresh_soundcard_devices();
+        }
+    }
+
+    fn refresh_soundcard_devices(&mut self) {
+        self.soundcard_devices = enumerate_input_devices();
+        self.push_diagnostic(
+            DiagnosticLevel::Info,
+            format!(
+                "soundcard: enumerated {} input device(s)",
+                self.soundcard_devices.len()
+            ),
+        );
+        if let Some(name) = self.selected_soundcard.as_deref() {
+            if !self.soundcard_devices.iter().any(|d| d.name == name) {
+                self.selected_soundcard = None;
+                self.push_diagnostic(
+                    DiagnosticLevel::Warn,
+                    "soundcard: previously-selected device is no longer available; falling back to default".to_string(),
+                );
+            }
         }
     }
 
@@ -1707,8 +1844,11 @@ fn run_decode_thread(
     input_mode: InputMode,
     decode_pace: DecodePace,
     input_path: Option<PathBuf>,
+    soundcard_device: Option<String>,
     tuning_offset_hz: f32,
     cached_alignment: Option<CachedAlignment>,
+    audio_mode: IoAudioMode,
+    audio_carrier_hz: f32,
     events: SyncSender<RxEvent>,
     stop: Receiver<()>,
 ) {
@@ -1716,9 +1856,12 @@ fn run_decode_thread(
     let mut runtime = match build_runtime_input(
         input_mode,
         input_path,
+        soundcard_device,
         &downlink,
         tuning_offset_hz,
         cached_alignment.as_ref(),
+        audio_mode,
+        audio_carrier_hz,
         &events,
     ) {
         Ok(runtime) => runtime,
@@ -1962,24 +2105,6 @@ fn pace_realtime_loop(
     }
 }
 
-fn read_iq_prefix(source: &mut dyn IqSource, len: usize) -> Result<Vec<IqSample>, String> {
-    let mut prefix = Vec::with_capacity(len);
-    let mut buf = [IqSample::default(); READ_CHUNK];
-    while prefix.len() < len {
-        let read = match source.read_samples(&mut buf) {
-            Ok(read) => read,
-            Err(IoError::EndOfStream) => break,
-            Err(err) => return Err(format!("failed to prime IQ WAV input: {err}")),
-        };
-        if read == 0 {
-            break;
-        }
-        let remaining = len - prefix.len();
-        prefix.extend_from_slice(&buf[..read.min(remaining)]);
-    }
-    Ok(prefix)
-}
-
 enum RuntimeInput {
     Audio {
         source: Box<dyn InputSource>,
@@ -2023,25 +2148,62 @@ impl RuntimeInput {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_runtime_input(
     input_mode: InputMode,
     input_path: Option<PathBuf>,
+    soundcard_device: Option<String>,
     downlink: &DownlinkDef,
     tuning_offset_hz: f32,
     cached_alignment: Option<&CachedAlignment>,
+    audio_mode: IoAudioMode,
+    audio_carrier_hz: f32,
     events: &SyncSender<RxEvent>,
 ) -> Result<RuntimeInput, String> {
     match input_mode {
-        InputMode::Soundcard => {
-            let source = SoundcardSource::open_default()
-                .map_err(|err| format!("soundcard open failed: {err}"))?;
-            let mut pipeline = BitPipeline::<f32>::new(downlink)?;
-            pipeline.configure_demodulator(downlink, source.sample_rate(), 0.0)?;
-            Ok(RuntimeInput::Audio {
-                source: Box::new(source),
-                pipeline,
-            })
-        }
+        InputMode::Soundcard => match input_kind_for(downlink) {
+            Some(InputKind::Iq) => {
+                let source = match soundcard_device.as_deref() {
+                    Some(name) => SoundcardIqSource::open_by_name(name)
+                        .map_err(|err| format!("soundcard IQ open failed: {err}"))?,
+                    None => SoundcardIqSource::open_default()
+                        .map_err(|err| format!("soundcard IQ open failed: {err}"))?,
+                };
+                let sample_rate = source.sample_rate();
+                if is_ao40_fec_downlink(downlink) {
+                    let pipeline = SoftAo40Pipeline::new(downlink, sample_rate, tuning_offset_hz)?;
+                    Ok(RuntimeInput::IqSoftAo40 {
+                        source: Box::new(source),
+                        pipeline: Box::new(pipeline),
+                        pending: Vec::new(),
+                    })
+                } else {
+                    let mut pipeline = BitPipeline::<IqSample>::new(downlink)?;
+                    pipeline.configure_demodulator(downlink, sample_rate, tuning_offset_hz)?;
+                    Ok(RuntimeInput::Iq {
+                        source: Box::new(source),
+                        pipeline,
+                        pending: Vec::new(),
+                    })
+                }
+            }
+            Some(InputKind::Audio) | Some(InputKind::FmAudio) => {
+                let source = match soundcard_device.as_deref() {
+                    Some(name) => SoundcardSource::open_by_name(name)
+                        .map_err(|err| format!("soundcard open failed: {err}"))?,
+                    None => SoundcardSource::open_default()
+                        .map_err(|err| format!("soundcard open failed: {err}"))?,
+                };
+                let sample_rate = source.sample_rate();
+                let mut pipeline = BitPipeline::<f32>::new(downlink)?;
+                pipeline.configure_demodulator(downlink, sample_rate, 0.0)?;
+                Ok(RuntimeInput::Audio {
+                    source: Box::new(source),
+                    pipeline,
+                })
+            }
+            None => Err("selected downlink is not supported by soundcard input".to_string()),
+        },
         InputMode::WavFile => {
             let Some(path) = input_path else {
                 return Err("missing WAV input path".to_string());
@@ -2058,110 +2220,166 @@ fn build_runtime_input(
                     })
                 }
                 Some(InputKind::Iq) => {
-                    let mut source = match WavIqSource::open(&path) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            // Mono file provided for an IQ downlink — fall back to FM audio path.
+                    let resolved = match audio_mode {
+                        IoAudioMode::Auto => detect_audio_mode_auto(&path)
+                            .map_err(|err| format!("audio mode auto-detect failed: {err}"))?,
+                        other => other,
+                    };
+                    match resolved {
+                        IoAudioMode::Iq | IoAudioMode::Auto => {
+                            let mut source = WavIqSource::open(&path)
+                                .map_err(|err| format!("failed to open IQ WAV input: {err}"))?;
+                            let sample_rate = source.sample_rate();
+                            let downlink_id = format!("{downlink:?}");
+                            let cache_hit = cached_alignment.filter(|cached| {
+                                cached.path == path
+                                    && cached.sample_rate == sample_rate
+                                    && cached.downlink_id == downlink_id
+                            });
+                            let (setup, prefix) = if let Some(cached) = cache_hit {
+                                if cached.prefix.is_empty() && cached.setup.sample_skip == 0 {
+                                    let _ = events.send(RxEvent::Dropped(format!(
+                                        "IQ alignment (non-linear): tuning={:.1} Hz",
+                                        cached.setup.tuning_offset_hz
+                                    )));
+                                } else {
+                                    let prefix_len = sample_rate as usize * 8;
+                                    let _ = read_iq_prefix(&mut source, prefix_len)?;
+                                    let _ = events.send(RxEvent::Dropped(format!(
+                                        "IQ alignment (cached): tuning={:.1} Hz skip={} prefix_frames={}",
+                                        cached.setup.tuning_offset_hz,
+                                        cached.setup.sample_skip,
+                                        cached.frames
+                                    )));
+                                }
+                                (cached.setup.clone(), cached.prefix.clone())
+                            } else {
+                                let prefix_len = sample_rate as usize * 8;
+                                let _ = events.send(RxEvent::Dropped(format!(
+                                    "reading 8 s IQ prefix at {} Hz\u{2026}",
+                                    sample_rate
+                                )));
+                                let mut prefix = read_iq_prefix(&mut source, prefix_len)?;
+                                let _ = events.send(RxEvent::Dropped(format!(
+                                    "scoring IQ alignment over {} samples\u{2026}",
+                                    prefix.len()
+                                )));
+                                let scored = prepare_linear_iq_setup_scored(
+                                    downlink,
+                                    sample_rate,
+                                    &prefix,
+                                    tuning_offset_hz,
+                                );
+                                let setup = match scored.as_ref() {
+                                    Some((setup, frames)) => {
+                                        let _ = events.send(RxEvent::Dropped(format!(
+                                            "IQ alignment: tuning={:.1} Hz skip={} prefix_frames={}",
+                                            setup.tuning_offset_hz, setup.sample_skip, frames
+                                        )));
+                                        setup.clone()
+                                    }
+                                    None => {
+                                        let _ = events.send(RxEvent::Dropped(format!(
+                                            "IQ alignment: TOML defaults (no candidate decoded; tuning={tuning_offset_hz:.1} Hz)"
+                                        )));
+                                        openhoshimi_runtime::pipeline::LinearIqSetup {
+                                            downlink: downlink.clone(),
+                                            tuning_offset_hz,
+                                            sample_skip: 0,
+                                        }
+                                    }
+                                };
+                                if setup.sample_skip < prefix.len() {
+                                    prefix = prefix.into_iter().skip(setup.sample_skip).collect();
+                                } else {
+                                    prefix.clear();
+                                }
+                                (setup, prefix)
+                            };
+                            if is_ao40_fec_downlink(&setup.downlink) {
+                                let pipeline = SoftAo40Pipeline::new(
+                                    &setup.downlink,
+                                    sample_rate,
+                                    setup.tuning_offset_hz,
+                                )?;
+                                Ok(RuntimeInput::IqSoftAo40 {
+                                    source: Box::new(source),
+                                    pipeline: Box::new(pipeline),
+                                    pending: prefix,
+                                })
+                            } else {
+                                let mut pipeline = BitPipeline::<IqSample>::new(&setup.downlink)?;
+                                pipeline.configure_demodulator(
+                                    &setup.downlink,
+                                    sample_rate,
+                                    setup.tuning_offset_hz,
+                                )?;
+                                Ok(RuntimeInput::Iq {
+                                    source: Box::new(source),
+                                    pipeline,
+                                    pending: prefix,
+                                })
+                            }
+                        }
+                        IoAudioMode::Fm => {
+                            let _ = events.send(RxEvent::Dropped(
+                                "audio mode: FM (mono real-audio path; tuning override ignored)"
+                                    .to_string(),
+                            ));
                             let source: Box<dyn InputSource> = open_audio_source(&path)?;
                             let sample_rate = source.sample_rate();
                             let mut pipeline = BitPipeline::<f32>::new(downlink)?;
                             pipeline.configure_fm_audio_demodulator(downlink, sample_rate)?;
-                            return Ok(RuntimeInput::Audio { source, pipeline });
+                            Ok(RuntimeInput::Audio { source, pipeline })
                         }
-                    };
-                    let sample_rate = source.sample_rate();
-                    let downlink_id = format!("{downlink:?}");
-                    let cache_hit = cached_alignment.filter(|cached| {
-                        cached.path == path
-                            && cached.sample_rate == sample_rate
-                            && cached.downlink_id == downlink_id
-                    });
-                    let (setup, prefix) = if let Some(cached) = cache_hit {
-                        if cached.prefix.is_empty() && cached.setup.sample_skip == 0 {
-                            // Non-linear-IQ short-circuit from run_alignment_thread:
-                            // skip the 8 s prefix read entirely so the decoder
-                            // sees the file from sample 0.
-                            let _ = events.send(RxEvent::Dropped(format!(
-                                "IQ alignment (non-linear): tuning={:.1} Hz",
-                                cached.setup.tuning_offset_hz
-                            )));
-                        } else {
-                            let prefix_len = sample_rate as usize * 8;
-                            let _ = read_iq_prefix(&mut source, prefix_len)?;
-                            let _ = events.send(RxEvent::Dropped(format!(
-                                "IQ alignment (cached): tuning={:.1} Hz skip={} prefix_frames={}",
-                                cached.setup.tuning_offset_hz,
-                                cached.setup.sample_skip,
-                                cached.frames
-                            )));
-                        }
-                        (cached.setup.clone(), cached.prefix.clone())
-                    } else {
-                        let prefix_len = sample_rate as usize * 8;
-                        let _ = events.send(RxEvent::Dropped(format!(
-                            "reading 8 s IQ prefix at {} Hz\u{2026}",
-                            sample_rate
-                        )));
-                        let mut prefix = read_iq_prefix(&mut source, prefix_len)?;
-                        let _ = events.send(RxEvent::Dropped(format!(
-                            "scoring IQ alignment over {} samples\u{2026}",
-                            prefix.len()
-                        )));
-                        let scored = prepare_linear_iq_setup_scored(
-                            downlink,
-                            sample_rate,
-                            &prefix,
-                            tuning_offset_hz,
-                        );
-                        let setup = match scored.as_ref() {
-                            Some((setup, frames)) => {
-                                let _ = events.send(RxEvent::Dropped(format!(
-                                    "IQ alignment: tuning={:.1} Hz skip={} prefix_frames={}",
-                                    setup.tuning_offset_hz, setup.sample_skip, frames
-                                )));
-                                setup.clone()
+                        IoAudioMode::Ssb => {
+                            if is_ao40_fec_downlink(downlink) {
+                                return Err(
+                                    "SSB mono audio is not supported for AO-40 soft FEC downlinks"
+                                        .to_string(),
+                                );
                             }
-                            None => {
+                            let mut mono = open_audio_source(&path)?;
+                            let sample_rate = mono.sample_rate();
+                            let (carrier_hz, prefix) = if audio_carrier_hz.is_finite()
+                                && audio_carrier_hz > 0.0
+                            {
                                 let _ = events.send(RxEvent::Dropped(format!(
-                                    "IQ alignment: TOML defaults (no candidate decoded; tuning={tuning_offset_hz:.1} Hz)"
+                                    "audio mode: SSB (mono->IQ via {audio_carrier_hz:.1} Hz audio carrier, user-supplied)"
                                 )));
-                                openhoshimi_runtime::pipeline::LinearIqSetup {
-                                    downlink: downlink.clone(),
-                                    tuning_offset_hz,
-                                    sample_skip: 0,
+                                (audio_carrier_hz, Vec::new())
+                            } else {
+                                let nyquist = sample_rate as f32 / 2.0;
+                                if nyquist <= 400.0 {
+                                    return Err(format!(
+                                        "SSB audio carrier auto-estimate: sample rate {sample_rate} Hz is too low"
+                                    ));
                                 }
-                            }
-                        };
-                        if setup.sample_skip < prefix.len() {
-                            prefix = prefix.into_iter().skip(setup.sample_skip).collect();
-                        } else {
-                            prefix.clear();
+                                let prefix_len = sample_rate as usize;
+                                let prefix = read_audio_prefix(&mut *mono, prefix_len)?;
+                                let estimate = estimate_audio_carrier(
+                                    &prefix,
+                                    sample_rate,
+                                    200.0,
+                                    nyquist - 200.0,
+                                )
+                                .ok_or_else(|| {
+                                    "SSB audio carrier auto-estimate failed: no peak in audio band; set Audio Carrier manually".to_string()
+                                })?;
+                                let _ = events.send(RxEvent::Dropped(format!(
+                                    "audio mode: SSB (mono->IQ via {estimate:.1} Hz audio carrier, auto-estimated)"
+                                )));
+                                (estimate, prefix)
+                            };
+                            let source = MonoIqSource::with_prefix(mono, prefix);
+                            let mut pipeline = BitPipeline::<IqSample>::new(downlink)?;
+                            pipeline.configure_demodulator(downlink, sample_rate, carrier_hz)?;
+                            Ok(RuntimeInput::Iq {
+                                source: Box::new(source),
+                                pipeline,
+                                pending: Vec::new(),
+                            })
                         }
-                        (setup, prefix)
-                    };
-                    if is_ao40_fec_downlink(&setup.downlink) {
-                        let pipeline = SoftAo40Pipeline::new(
-                            &setup.downlink,
-                            sample_rate,
-                            setup.tuning_offset_hz,
-                        )?;
-                        Ok(RuntimeInput::IqSoftAo40 {
-                            source: Box::new(source),
-                            pipeline: Box::new(pipeline),
-                            pending: prefix,
-                        })
-                    } else {
-                        let mut pipeline = BitPipeline::<IqSample>::new(&setup.downlink)?;
-                        pipeline.configure_demodulator(
-                            &setup.downlink,
-                            sample_rate,
-                            setup.tuning_offset_hz,
-                        )?;
-                        Ok(RuntimeInput::Iq {
-                            source: Box::new(source),
-                            pipeline,
-                            pending: prefix,
-                        })
                     }
                 }
                 Some(InputKind::FmAudio) => {
@@ -2401,6 +2619,19 @@ fn decoded_frame_row(
             }
             raw = payload;
         }
+        DecodedFrame::Geoscan(geoscan) => {
+            source = "GEOSCAN".to_string();
+            destination = "BEACON".to_string();
+            kind = if geoscan.crc_ok {
+                FrameKind::Tlm
+            } else {
+                FrameKind::Err
+            };
+            if let Some(parser) = telemetry {
+                fields = parser.parse_bytes(&geoscan.payload);
+            }
+            raw = geoscan.payload;
+        }
         DecodedFrame::Raw { raw_len, .. } => {
             raw = vec![0u8; raw_len];
         }
@@ -2458,6 +2689,18 @@ where
                 fields = parser.parse_bytes(&payload);
             }
             kind = FrameKind::Tlm;
+        }
+        DecodedFrame::Geoscan(geoscan) => {
+            source = "GEOSCAN".to_string();
+            destination = "BEACON".to_string();
+            kind = if geoscan.crc_ok {
+                FrameKind::Tlm
+            } else {
+                FrameKind::Err
+            };
+            if let Some(parser) = telemetry {
+                fields = parser.parse_bytes(&geoscan.payload);
+            }
         }
         DecodedFrame::Raw { .. } => {
             if let Some(parser) = telemetry {
@@ -3037,26 +3280,6 @@ fn push_satellite_dir_candidates(candidates: &mut Vec<PathBuf>, root: &Path) {
         let candidate = ancestor.join("satellites");
         if !candidates.iter().any(|existing| existing == &candidate) {
             candidates.push(candidate);
-        }
-    }
-}
-
-/// Open a mono audio source from a WAV or OGG file, based on extension.
-fn open_audio_source(path: &Path) -> Result<Box<dyn InputSource>, String> {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        "ogg" => {
-            let source =
-                OggSource::open(path).map_err(|err| format!("failed to open OGG file: {err}"))?;
-            Ok(Box::new(source))
-        }
-        _ => {
-            let source =
-                WavSource::open(path).map_err(|err| format!("failed to open WAV file: {err}"))?;
-            Ok(Box::new(source))
         }
     }
 }
