@@ -16,6 +16,7 @@
 
 pub mod afsk;
 pub mod ao40;
+pub mod carrier;
 pub mod ccsds;
 pub mod cpm;
 pub mod fft;
@@ -28,6 +29,7 @@ pub mod syncword;
 
 pub use afsk::AfskDemodulator;
 pub use ao40::Ao40Framer;
+pub use carrier::estimate_audio_carrier;
 pub use ccsds::CcsdsDescrambler;
 pub use cpm::{CpmConfig, CpmDemodulator, CpmMode};
 pub use fft::{bin_frequency_hz, fft_in_place, hann_window, Complex};
