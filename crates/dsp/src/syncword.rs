@@ -19,6 +19,8 @@ pub struct SyncwordFramer {
     current_payload: Vec<u8>,
     frame_type: FrameType,
     pack_bits: bool,
+    sync_attempts: u64,
+    sync_locked: u64,
 }
 
 impl SyncwordFramer {
@@ -44,7 +46,22 @@ impl SyncwordFramer {
             current_payload: Vec::with_capacity(payload_bits),
             frame_type,
             pack_bits,
+            sync_attempts: 0,
+            sync_locked: 0,
         }
+    }
+
+    /// Number of full-length syncword candidates the framer has compared
+    /// against the configured pattern. One attempt corresponds to one
+    /// shift of the shift register once it has been filled.
+    pub fn sync_attempts(&self) -> u64 {
+        self.sync_attempts
+    }
+
+    /// Number of times the framer has locked onto the syncword (a
+    /// candidate whose Hamming distance was within `threshold`).
+    pub fn sync_locked(&self) -> u64 {
+        self.sync_locked
     }
 
     /// Push one-bit-per-byte bits and return complete payload bit vectors.
@@ -69,11 +86,13 @@ impl SyncwordFramer {
                 self.shift_register.remove(0);
             }
 
-            if self.shift_register.len() == self.syncword.len()
-                && hamming_distance(&self.shift_register, &self.syncword) <= self.threshold
-            {
-                self.collecting = true;
-                self.current_payload.clear();
+            if self.shift_register.len() == self.syncword.len() {
+                self.sync_attempts = self.sync_attempts.saturating_add(1);
+                if hamming_distance(&self.shift_register, &self.syncword) <= self.threshold {
+                    self.sync_locked = self.sync_locked.saturating_add(1);
+                    self.collecting = true;
+                    self.current_payload.clear();
+                }
             }
         }
 

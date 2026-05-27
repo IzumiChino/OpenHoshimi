@@ -42,6 +42,7 @@ egui_extras = "0.31"
 rfd = "0.14.1"
 rustfft = "6.4"
 rayon = "1.10"
+png = "0.17"
 
 [profile.release]
 lto = "thin"

@@ -59,8 +59,11 @@ swap_iq = false
 kind = "syncword"
 # CC1125 syncword 0x930B51DE, MSB-first.
 syncword = "10010011000010110101000111011110"
-# Tolerate up to 2 bit errors in the 32-bit syncword.
-threshold = 2
+# Tolerate up to 4 bit errors in the 32-bit syncword. gr-satellites
+# uses the same threshold for the Geoscan / CC11xx flowgraphs; with
+# only 2 bit errors allowed we drop a large fraction of the frames
+# SatNOGS recovers from the same recording.
+threshold = 4
 # Fixed 66-byte block: 64-byte payload + 2-byte CRC.
 payload_bits = 528
 
@@ -69,3 +72,29 @@ payload_bits = 528
 # the trailing CRC-16. The PN9 LFSR is reset per frame, mirroring CC1125
 # hardware whitening which restarts on the first byte after the syncword.
 kind = "geoscan"
+
+# Optional image-reassembly stage. Geoscan-format image frames have a
+# fixed 3-byte prefix `02 00 3E`:
+#   byte 0   = satellite number (0x02 for STRATOSAT-TK-1)
+#   byte 1   = reserved (0x00)
+#   byte 2   = data field size (0x3E = 62)
+# Bytes 3..5 carry a 2-byte "message type" that varies per image
+# class (e.g. 0x05 0x09, 0x0D 0x09, ...) and so cannot be part of the
+# signature. Bytes 5..7 are the LE byte offset into the canvas, byte 7
+# is the subsystem / group id, and bytes 8..64 are the 56-byte chunk.
+#
+# Caveat: real Geoscan downlinks transmit JPEG bitstream chunks, not
+# raw pixels. Our reassembler concatenates chunks as raw bytes, so the
+# rendered canvas is a debug view, not a faithful image. JPEG decoding
+# is a future enhancement; the image tab still gives a useful "filled
+# / missing chunks" status while that work lands.
+[downlink.image]
+protocol = "geoscan"
+header_signature = "02 00 3E"
+offset_field = { at = 5, len = 2, endian = "le" }
+group_field = { at = 7, len = 1, endian = "be" }
+chunk_at = 8
+chunk_bytes = 56
+width = 1536
+height = 1024
+pixel_format = "gray8"

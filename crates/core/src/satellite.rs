@@ -116,6 +116,11 @@ pub struct DownlinkDef {
     /// Structured frame decoder configuration.
     #[serde(default)]
     pub codec: Option<CodecDef>,
+    /// Optional image-frame reassembly stage. Set when the downlink
+    /// carries images split across many small frames (e.g. STRATOSAT-TK-1
+    /// thumbnails).
+    #[serde(default)]
+    pub image: Option<ImageDef>,
 }
 
 /// Modem configuration for a downlink.
@@ -344,6 +349,87 @@ pub enum Ax100ModeDef {
     AsmGolay,
 }
 
+/// Image-frame reassembly configuration.
+///
+/// When a downlink carries images split across many small frames, the
+/// runtime hands each decoded payload to a stateful reassembler that
+/// drops it into the correct slot of a per-group canvas. v1 only supports
+/// the Geoscan custom protocol used by STRATOSAT-TK-1 and Geoscan-Edelveis;
+/// SSDV and other protocols arrive as additional variants of this enum.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum ImageDef {
+    /// Geoscan custom protocol: each frame begins with a fixed
+    /// `header_signature`, followed by a 16-bit `packet_offset` field
+    /// (byte offset into the linear pixel buffer), a `subsystem` group id,
+    /// and a fixed-length raw chunk.
+    Geoscan {
+        /// Header bytes that must appear at the start of an image frame's
+        /// payload. Whitespace is ignored. Frames whose first
+        /// `header_signature.len()/2` bytes do not match are skipped by
+        /// the reassembler.
+        header_signature: String,
+        /// Byte location, length, and endianness of the packet-offset
+        /// field inside the frame payload.
+        offset_field: ImageField,
+        /// Byte location and length of the subsystem / group-id field
+        /// inside the frame payload. Endianness is irrelevant for
+        /// 1-byte fields and follows `offset_field` rules otherwise.
+        group_field: ImageField,
+        /// First byte of the raw image chunk inside the frame payload.
+        chunk_at: usize,
+        /// Length of the raw image chunk in bytes (typically 56 for the
+        /// 64-byte Geoscan payload).
+        chunk_bytes: usize,
+        /// Canvas width in pixels. Defaults to 320.
+        #[serde(default = "default_image_width")]
+        width: u32,
+        /// Canvas height in pixels. Defaults to 240.
+        #[serde(default = "default_image_height")]
+        height: u32,
+        /// Pixel format used to interpret raw chunk bytes. Defaults to
+        /// `Gray8`.
+        #[serde(default)]
+        pixel_format: PixelFormatDef,
+    },
+}
+
+/// Location of a fixed integer field inside a frame payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageField {
+    /// Byte offset of the field's first byte inside the frame payload.
+    pub at: usize,
+    /// Field length in bytes.
+    pub len: usize,
+    /// Byte order of multi-byte fields. Defaults to big-endian.
+    #[serde(default)]
+    pub endian: ByteOrderDef,
+}
+
+/// Pixel format for an image-reassembly canvas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelFormatDef {
+    /// 8-bit grayscale; one byte per pixel.
+    #[default]
+    Gray8,
+    /// 16-bit RGB565; two bytes per pixel, big-endian.
+    Rgb565,
+    /// 24-bit RGB888; three bytes per pixel.
+    Rgb888,
+}
+
+/// Byte order for multi-byte integer fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ByteOrderDef {
+    /// Big-endian (most significant byte first).
+    #[default]
+    Be,
+    /// Little-endian (least significant byte first).
+    Le,
+}
+
 /// A telemetry schema: the layout of fields inside a frame's payload.
 ///
 /// Schemas are referenced by name from a [`DownlinkDef::telemetry_schema`].
@@ -463,6 +549,14 @@ fn default_interleave() -> usize {
 
 fn default_ax100_asm_threshold() -> usize {
     4
+}
+
+fn default_image_width() -> u32 {
+    320
+}
+
+fn default_image_height() -> u32 {
+    240
 }
 
 fn required<'de, D, T>(deserializer: D) -> Result<T, D::Error>

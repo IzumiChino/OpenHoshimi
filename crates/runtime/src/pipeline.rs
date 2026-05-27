@@ -830,6 +830,29 @@ fn push_candidate(candidates: &mut Vec<f32>, candidate: f32) {
     candidates.push(candidate);
 }
 
+/// Snapshot of per-stage pipeline counters.
+///
+/// Used by the GUI to render a live "how many samples turned into how
+/// many bits, how many syncword candidates we evaluated, and how many
+/// frames we emitted" status row. The counters are monotonic and reset
+/// when the pipeline is rebuilt (e.g. on downlink change).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PipelineStats {
+    /// Number of input samples processed.
+    pub samples_in: u64,
+    /// Number of bits produced by the demodulator (post line-decoder /
+    /// descrambler).
+    pub total_bits: u64,
+    /// Number of frames the framer has emitted.
+    pub frames_emitted: u64,
+    /// Number of syncword candidates the framer has compared against the
+    /// configured pattern. `None` for non-syncword framers (HDLC).
+    pub sync_attempts: Option<u64>,
+    /// Number of times the framer has locked onto the syncword. `None`
+    /// for non-syncword framers (HDLC).
+    pub sync_locked: Option<u64>,
+}
+
 /// Hard-decision pipeline from samples to decoded frames.
 pub struct BitPipeline<S>
 where
@@ -841,6 +864,8 @@ where
     framer: FrameStage,
     codec: CodecStage,
     total_samples: u64,
+    total_bits: u64,
+    frames_emitted: u64,
 }
 
 impl BitPipeline<f32> {
@@ -912,6 +937,8 @@ where
             framer: build_framer(downlink)?,
             codec: build_codec(downlink)?,
             total_samples: 0,
+            total_bits: 0,
+            frames_emitted: 0,
         })
     }
 
@@ -929,7 +956,10 @@ where
         if let Some(descrambler) = self.descrambler.as_mut() {
             descrambler.descramble(&mut bits);
         }
-        self.framer.push_bits(&bits)
+        self.total_bits = self.total_bits.saturating_add(bits.len() as u64);
+        let frames = self.framer.push_bits(&bits);
+        self.frames_emitted = self.frames_emitted.saturating_add(frames.len() as u64);
+        frames
     }
 
     /// Decode a framed payload.
@@ -963,6 +993,17 @@ where
     /// Best AO-40 sync distance observed by the active framer, if any.
     pub fn best_sync_distance(&self) -> Option<usize> {
         self.framer.best_sync_distance()
+    }
+
+    /// Snapshot of per-stage counters for live diagnostics.
+    pub fn pipeline_stats(&self) -> PipelineStats {
+        PipelineStats {
+            samples_in: self.total_samples,
+            total_bits: self.total_bits,
+            frames_emitted: self.frames_emitted,
+            sync_attempts: self.framer.sync_attempts(),
+            sync_locked: self.framer.sync_locked(),
+        }
     }
 }
 
@@ -1211,6 +1252,20 @@ impl FrameStage {
             Self::Ao40(framer) => framer.best_sync_distance(),
             Self::Hdlc(_) => None,
             Self::Syncword(_) => None,
+        }
+    }
+
+    fn sync_attempts(&self) -> Option<u64> {
+        match self {
+            Self::Syncword(framer) => Some(framer.sync_attempts()),
+            Self::Ao40(_) | Self::Hdlc(_) => None,
+        }
+    }
+
+    fn sync_locked(&self) -> Option<u64> {
+        match self {
+            Self::Syncword(framer) => Some(framer.sync_locked()),
+            Self::Ao40(_) | Self::Hdlc(_) => None,
         }
     }
 }

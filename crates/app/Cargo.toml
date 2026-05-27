@@ -23,3 +23,4 @@ eframe = { workspace = true }
 egui_extras = { workspace = true }
 rfd = { workspace = true }
 rustfft = { workspace = true }
+png = { workspace = true }

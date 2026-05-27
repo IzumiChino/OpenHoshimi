@@ -34,7 +34,7 @@ use openhoshimi_runtime::pipeline::{
     format_hex, format_timestamp, infer_tuning_offset_hz, input_kind_for, is_ao40_fec_downlink,
     is_linear_iq_modem, prepare_linear_iq_setup_scored,
     prepare_linear_iq_setup_scored_with_progress, BitPipeline, DecodedFrame, InputKind,
-    SoftAo40Pipeline,
+    PipelineStats, SoftAo40Pipeline,
 };
 use openhoshimi_telemetry::SchemaParser;
 use rfd::FileDialog;
@@ -71,6 +71,18 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(OpenHoshimiApp::new(cc)))),
     )
+}
+
+/// Selects which view occupies the lower half of the middle column.
+/// Only the Frames variant is reachable on satellites that do not
+/// declare a `[downlink.image]` block in their TOML; in that case the
+/// tab bar is hidden and the field stays at its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomTab {
+    /// Original frame list + hex inspector view.
+    Frames,
+    /// Image reassembly canvas + packet grid + status row.
+    Image,
 }
 
 /// Main GUI state.
@@ -129,6 +141,41 @@ struct OpenHoshimiApp {
     /// this carrier to baseband and the complex low-pass kills the
     /// mirror sideband.
     audio_carrier_hz: f32,
+    /// Which view the middle column's lower region is currently showing.
+    /// Only meaningful when the active downlink declares a
+    /// `[downlink.image]` block; otherwise the tab bar is hidden and the
+    /// Frames view renders unconditionally.
+    bottom_tab: BottomTab,
+    /// Stateful image reassembler for the active downlink, populated
+    /// from `DownlinkDef::image` whenever the user selects a downlink
+    /// that carries images. `None` for satellites without image support.
+    image_reassembler: Option<Box<dyn openhoshimi_codec::ImageReassembler>>,
+    /// GPU texture for the currently-displayed image canvas. Rebuilt
+    /// lazily from `image_reassembler.snapshot()` when `image_dirty` is
+    /// set.
+    image_texture: Option<egui::TextureHandle>,
+    /// Set when a new chunk has been ingested, consumed by the image
+    /// view on the next repaint to upload a fresh texture.
+    image_dirty: bool,
+    /// Group id currently shown in the image view. Stays at 0 until the
+    /// user clicks a different group chip.
+    image_active_group: u32,
+    /// Diagnostic counter for image payloads that arrived while the
+    /// reassembler was active but failed the header / structural check.
+    /// Reset whenever the reassembler is rebuilt.
+    image_payload_misses: u32,
+    /// Diagnostic counter for image payloads that were successfully
+    /// ingested into the reassembler. Reset on rebuild.
+    image_payload_hits: u32,
+    /// Set once we have logged a representative non-matching payload
+    /// prefix to the diagnostic panel, so the log is not flooded.
+    image_payload_logged: bool,
+    /// Most recent pipeline counters published by the decode thread.
+    /// `None` until the first `RxEvent::PipelineStats` arrives or after
+    /// a downlink change resets the GUI side.  Surfaced in the status
+    /// bar so the operator can tell at a glance how far signal is making
+    /// it through demod / sync / framing.
+    latest_stats: Option<PipelineStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +219,18 @@ enum RxEvent {
     },
     AlignmentReady(Box<CachedAlignment>),
     AlignmentFailed(String),
+    /// Raw payload bytes from a `DecodedFrame::Geoscan` frame, forwarded
+    /// to the GUI's image reassembler. Sent for every Geoscan frame so
+    /// the GUI side decides whether to ingest based on its own
+    /// reassembler state.
+    ImagePayload(Vec<u8>),
+    /// Cumulative pipeline counters (samples in, demodulated bits, sync
+    /// attempts / locks, frames emitted) sampled from `BitPipeline` after
+    /// each `push_samples` call. Surfaced in the status bar so the
+    /// operator can see, while a recording is running, why frames are
+    /// not coming through (no bits at all? syncword never matching?
+    /// matches but no frames clearing CRC?).
+    PipelineStats(PipelineStats),
 }
 
 #[derive(Clone)]
@@ -273,8 +332,18 @@ impl OpenHoshimiApp {
             selected_soundcard: None,
             audio_mode: IoAudioMode::Auto,
             audio_carrier_hz: 0.0,
+            bottom_tab: BottomTab::Frames,
+            image_reassembler: None,
+            image_texture: None,
+            image_dirty: false,
+            image_active_group: 0,
+            image_payload_misses: 0,
+            image_payload_hits: 0,
+            image_payload_logged: false,
+            latest_stats: None,
         };
         app.reload_satellites();
+        app.refresh_image_reassembler();
         app
     }
 
@@ -515,6 +584,34 @@ impl OpenHoshimiApp {
                         let _ = handle.join();
                     }
                 }
+                RxEvent::ImagePayload(bytes) => {
+                    if let Some(reassembler) = self.image_reassembler.as_mut() {
+                        if reassembler.ingest(&bytes).is_some() {
+                            self.image_dirty = true;
+                            self.image_payload_hits = self.image_payload_hits.saturating_add(1);
+                        } else {
+                            self.image_payload_misses = self.image_payload_misses.saturating_add(1);
+                            if !self.image_payload_logged {
+                                self.image_payload_logged = true;
+                                let take = bytes.len().min(16);
+                                let prefix: Vec<String> =
+                                    bytes[..take].iter().map(|b| format!("{:02X}", b)).collect();
+                                self.push_diagnostic(
+                                    DiagnosticLevel::Info,
+                                    format!(
+                                        "image: payload did not match header signature; \
+                                         len={} prefix=[{}]",
+                                        bytes.len(),
+                                        prefix.join(" "),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                RxEvent::PipelineStats(stats) => {
+                    self.latest_stats = Some(stats);
+                }
             }
         }
         if let Some(samples) = latest_samples {
@@ -549,6 +646,7 @@ impl OpenHoshimiApp {
         self.samples_processed = 0;
         self.input_progress_processed = 0;
         self.input_progress_total = None;
+        self.latest_stats = None;
     }
 
     fn export_frames(&mut self) {
@@ -1013,6 +1111,22 @@ impl OpenHoshimiApp {
                 &format!("drop: {}", self.dropped_frames),
                 Palette::MUTED,
             );
+            if let Some(stats) = self.latest_stats {
+                status_segment(ui, &format!("bits: {}", stats.total_bits), Palette::MUTED);
+                if let (Some(locked), Some(attempts)) = (stats.sync_locked, stats.sync_attempts) {
+                    let color = if locked > 0 {
+                        Palette::GREEN
+                    } else {
+                        Palette::MUTED
+                    };
+                    status_segment(ui, &format!("sync: {}/{}", locked, attempts), color);
+                }
+                status_segment(
+                    ui,
+                    &format!("emit: {}", stats.frames_emitted),
+                    Palette::MUTED,
+                );
+            }
             if !self.status.is_empty() {
                 let status_lower = self.status.to_ascii_lowercase();
                 let color = if status_lower.contains("failed")
@@ -1085,6 +1199,7 @@ impl OpenHoshimiApp {
                         self.samples_processed = 0;
                         self.input_progress_processed = 0;
                         self.input_progress_total = None;
+                        self.refresh_image_reassembler();
                         self.push_diagnostic(
                             DiagnosticLevel::Info,
                             format!("selected satellite {}", satellite_name),
@@ -1139,8 +1254,46 @@ impl OpenHoshimiApp {
     fn center_workspace(&mut self, ui: &mut egui::Ui) {
         self.spectrum(ui);
         self.frame_toolbar(ui);
-        self.frame_table(ui);
-        self.hex_dump(ui);
+        if self.image_reassembler.is_some() {
+            self.bottom_tab_bar(ui);
+            match self.bottom_tab {
+                BottomTab::Frames => {
+                    self.frame_table(ui);
+                    self.hex_dump(ui);
+                }
+                BottomTab::Image => {
+                    self.image_view(ui);
+                }
+            }
+        } else {
+            self.frame_table(ui);
+            self.hex_dump(ui);
+        }
+    }
+
+    /// Render the [Frames] [Image] tab strip above the lower region of
+    /// the middle column. Only called when the active downlink declares
+    /// an image-reassembly stage; satellites without image support skip
+    /// this row entirely.
+    fn bottom_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.painter()
+                    .rect_filled(ui.max_rect(), CornerRadius::ZERO, Palette::PANEL);
+                ui.add_space(6.0);
+                let frames_active = matches!(self.bottom_tab, BottomTab::Frames);
+                let image_active = matches!(self.bottom_tab, BottomTab::Image);
+                if tab_button(ui, "Frames", frames_active).clicked() {
+                    self.bottom_tab = BottomTab::Frames;
+                }
+                ui.add_space(4.0);
+                if tab_button(ui, "Image", image_active).clicked() {
+                    self.bottom_tab = BottomTab::Image;
+                }
+            },
+        );
     }
 
     fn spectrum(&mut self, ui: &mut egui::Ui) {
@@ -1418,6 +1571,215 @@ impl OpenHoshimiApp {
                         }
                     });
             });
+    }
+
+    /// Render the image-reassembly view: canvas on top with a status
+    /// row underneath showing per-group receipt progress, plus Reset
+    /// and Save PNG controls. Cheap to call every frame; the texture
+    /// is only re-uploaded when [`Self::image_dirty`] is set or no
+    /// texture exists yet, so steady-state cost is one painter.image
+    /// call.
+    fn image_view(&mut self, ui: &mut egui::Ui) {
+        let snapshot = match self.image_reassembler.as_ref() {
+            Some(r) => r.snapshot(),
+            None => return,
+        };
+        let group_count = snapshot.groups.len();
+        let active_group_idx = snapshot
+            .groups
+            .iter()
+            .position(|g| g.group_id == self.image_active_group)
+            .unwrap_or(0);
+        let active_group = snapshot.groups.get(active_group_idx);
+        let needs_upload = self.image_dirty || self.image_texture.is_none();
+        if needs_upload {
+            if let Some(group) = active_group {
+                let color_image = render_image(&snapshot, group);
+                match self.image_texture.as_mut() {
+                    Some(tex) => tex.set(color_image, TextureOptions::NEAREST),
+                    None => {
+                        self.image_texture = Some(ui.ctx().load_texture(
+                            "image_canvas",
+                            color_image,
+                            TextureOptions::NEAREST,
+                        ));
+                    }
+                }
+            } else {
+                self.image_texture = None;
+            }
+            self.image_dirty = false;
+        }
+        let avail = ui.available_size();
+        let canvas_h = (avail.y - 56.0).max(120.0);
+        let canvas_w = avail.x;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
+        if let Some(tex) = self.image_texture.as_ref() {
+            let (img_w, img_h) = (snapshot.width as f32, snapshot.height as f32);
+            let scale = (canvas_w / img_w).min(canvas_h / img_h);
+            let draw = Vec2::new(img_w * scale, img_h * scale);
+            let origin = Pos2::new(
+                rect.center().x - draw.x * 0.5,
+                rect.center().y - draw.y * 0.5,
+            );
+            let dest = Rect::from_min_size(origin, draw);
+            ui.painter().image(
+                tex.id(),
+                dest,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "waiting for image chunks\u{2026}",
+                FontId::monospace(12.0),
+                Palette::MUTED,
+            );
+        }
+        self.image_status_row(ui, &snapshot, group_count);
+    }
+
+    /// Status strip for the image view: shows current group, progress
+    /// (`received/total chunks`, percent complete), a group selector
+    /// chip row, and Reset / Save PNG buttons. Hidden when there are
+    /// no active groups yet.
+    fn image_status_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &openhoshimi_codec::ImageSnapshot,
+        group_count: usize,
+    ) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.painter()
+                    .rect_filled(ui.max_rect(), CornerRadius::ZERO, Palette::PANEL);
+                ui.add_space(6.0);
+                if group_count == 0 {
+                    if self.image_payload_misses > 0 {
+                        label_muted(
+                            ui,
+                            &format!(
+                                "no image chunks yet | header miss={} hit={} (check [downlink.image] header_signature)",
+                                self.image_payload_misses, self.image_payload_hits,
+                            ),
+                        );
+                    } else {
+                        label_muted(ui, "no image chunks received yet");
+                    }
+                    return;
+                }
+                let active = snapshot
+                    .groups
+                    .iter()
+                    .find(|g| g.group_id == self.image_active_group)
+                    .or_else(|| snapshot.groups.first());
+                if let Some(group) = active {
+                    let pct = if group.total_chunks == 0 {
+                        0.0
+                    } else {
+                        100.0 * group.received_count as f32 / group.total_chunks as f32
+                    };
+                    label_muted(
+                        ui,
+                        &format!(
+                            "group {}: {}/{} chunks ({:.1}%)",
+                            group.group_id, group.received_count, group.total_chunks, pct
+                        ),
+                    );
+                }
+                ui.add_space(8.0);
+                self.image_status_row_groups(ui, snapshot);
+                self.image_status_row_buttons(ui, snapshot);
+            },
+        );
+    }
+
+    fn image_status_row_groups(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &openhoshimi_codec::ImageSnapshot,
+    ) {
+        for group in &snapshot.groups {
+            let active = group.group_id == self.image_active_group;
+            if tab_button(ui, &format!("g{}", group.group_id), active).clicked() && !active {
+                self.image_active_group = group.group_id;
+                self.image_dirty = true;
+            }
+            ui.add_space(2.0);
+        }
+    }
+
+    fn image_status_row_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &openhoshimi_codec::ImageSnapshot,
+    ) {
+        ui.add_space(8.0);
+        if bracket_button(ui, "Reset", 60.0).clicked() {
+            if let Some(r) = self.image_reassembler.as_mut() {
+                r.reset();
+            }
+            self.image_texture = None;
+            self.image_active_group = 0;
+            self.image_dirty = true;
+        }
+        if bracket_button(ui, "Save PNG", 80.0).clicked() {
+            if let Err(err) = self.save_image_png(snapshot) {
+                self.push_diagnostic(DiagnosticLevel::Error, format!("save PNG failed: {err}"));
+            }
+        }
+    }
+
+    /// Encode the active group's reassembled buffer as a PNG and write
+    /// it to a user-selected file. Returns `Err` only on encoder/IO
+    /// failure; the user simply cancelling the dialog is reported as
+    /// `Ok(())` so the caller does not surface a spurious error.
+    fn save_image_png(&self, snapshot: &openhoshimi_codec::ImageSnapshot) -> Result<(), String> {
+        let group = snapshot
+            .groups
+            .iter()
+            .find(|g| g.group_id == self.image_active_group)
+            .or_else(|| snapshot.groups.first())
+            .ok_or_else(|| "no image group available".to_string())?;
+        let default_name = format!(
+            "openhoshimi_image_g{}_{}x{}.png",
+            group.group_id, snapshot.width, snapshot.height
+        );
+        let Some(path) = FileDialog::new()
+            .set_file_name(default_name)
+            .add_filter("PNG", &["png"])
+            .save_file()
+        else {
+            return Ok(());
+        };
+        let file =
+            std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = png::Encoder::new(writer, snapshot.width, snapshot.height);
+        match snapshot.pixel_format {
+            openhoshimi_codec::PixelFormat::Gray8 => {
+                encoder.set_color(png::ColorType::Grayscale);
+                encoder.set_depth(png::BitDepth::Eight);
+            }
+            openhoshimi_codec::PixelFormat::Rgb565 | openhoshimi_codec::PixelFormat::Rgb888 => {
+                encoder.set_color(png::ColorType::Rgb);
+                encoder.set_depth(png::BitDepth::Eight);
+            }
+        }
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("png header: {e}"))?;
+        let pixels = encode_pixels_for_png(snapshot, group);
+        writer
+            .write_image_data(&pixels)
+            .map_err(|e| format!("png write: {e}"))?;
+        Ok(())
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
@@ -1726,12 +2088,42 @@ impl OpenHoshimiApp {
         if before != self.selected_downlink {
             self.clear_frames();
             self.waterfall.clear();
+            self.refresh_image_reassembler();
             if let Some(downlink) = self.selected_downlink() {
                 self.push_diagnostic(
                     DiagnosticLevel::Info,
                     format!("selected downlink {}", downlink_combo_label(downlink)),
                 );
             }
+        }
+    }
+
+    /// Rebuild [`Self::image_reassembler`] from the active downlink's
+    /// `[downlink.image]` block, dropping any prior reassembler state
+    /// and the cached texture. Called when the user switches downlink
+    /// (or, indirectly, satellite). Forces `bottom_tab` back to
+    /// `Frames` if the new downlink does not support images so the
+    /// hidden tab bar can never leave the user stranded on a stale
+    /// view.
+    fn refresh_image_reassembler(&mut self) {
+        self.image_reassembler = None;
+        self.image_texture = None;
+        self.image_dirty = false;
+        self.image_active_group = 0;
+        self.image_payload_misses = 0;
+        self.image_payload_hits = 0;
+        self.image_payload_logged = false;
+        let image_def = self.selected_downlink().and_then(|d| d.image.clone());
+        if let Some(def) = image_def {
+            match openhoshimi_codec::build_image_reassembler(&def) {
+                Ok(r) => self.image_reassembler = Some(r),
+                Err(err) => self.push_diagnostic(
+                    DiagnosticLevel::Error,
+                    format!("image reassembler init failed: {err}"),
+                ),
+            }
+        } else {
+            self.bottom_tab = BottomTab::Frames;
         }
     }
 
@@ -1928,6 +2320,7 @@ fn run_decode_thread(
                     &mut count,
                     frames,
                 );
+                let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
                 let _ = events.send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
@@ -1959,6 +2352,7 @@ fn run_decode_thread(
                         &mut count,
                         frames,
                     );
+                    let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
                     let _ = events.send(RxEvent::Progress {
                         processed: pipeline.total_samples(),
                         total: total_samples,
@@ -1995,6 +2389,7 @@ fn run_decode_thread(
                     &mut count,
                     frames,
                 );
+                let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
                 let _ = events.send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
@@ -2540,6 +2935,15 @@ fn emit_frames<P>(
     for mut frame in frames {
         *count += 1;
         frame.satellite_id = satellite.satellite.norad_id;
+        // Tap Geoscan payloads for the image reassembler. emit_frames
+        // is the path that runs the framer + codec inside frame_row
+        // (raw whitened bytes get stored on the FrameRow), so we have
+        // to decode once more here to recover the descrambled payload.
+        // Decoding is cheap (PN9 + CRC compare) and fires only when the
+        // codec stage is Geoscan to begin with.
+        if let Ok(DecodedFrame::Geoscan(ref geoscan)) = pipeline.decode_frame(&frame) {
+            let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+        }
         let row = frame_row(*count, start.elapsed(), pipeline, &frame, telemetry);
         match row {
             Ok(row) => {
@@ -2562,6 +2966,17 @@ fn emit_decoded_frames(
 ) {
     for decoded in frames {
         *count += 1;
+        // Tap every Geoscan payload for the image reassembler before
+        // converting to FrameRow. The GUI side decides whether to
+        // actually ingest based on whether the active downlink has
+        // [downlink.image] configured. We deliberately do NOT gate on
+        // crc_ok here: image chunks streaming over a LEO pass routinely
+        // miss CRC, but the header bytes and most of the 56-byte chunk
+        // are still usable, and the reassembler's header_signature
+        // check is the real filter.
+        if let DecodedFrame::Geoscan(ref geoscan) = decoded {
+            let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+        }
         let row = decoded_frame_row(*count, start.elapsed(), satellite, decoded, telemetry);
         let _ = events.send(RxEvent::Frame(row));
     }
@@ -2818,6 +3233,25 @@ fn bracket_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response 
             .corner_radius(CornerRadius::ZERO)
             .fill(Palette::PANEL)
             .stroke(Stroke::new(1.0, Palette::LINE)),
+    )
+}
+
+/// Compact tab toggle used by the bottom-region tab bar. Active tabs
+/// are filled with the panel-active blue and white text; inactive tabs
+/// match the panel background. Width is auto-sized to the label so the
+/// strip can grow naturally if more tabs land later.
+fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let (fill, text) = if active {
+        (Palette::BLUE, Color32::WHITE)
+    } else {
+        (Palette::PANEL, Palette::TEXT)
+    };
+    ui.add(
+        egui::Button::new(RichText::new(format!("[{label}]")).color(text).monospace())
+            .corner_radius(CornerRadius::ZERO)
+            .fill(fill)
+            .stroke(Stroke::new(1.0, Palette::LINE))
+            .min_size(Vec2::new(0.0, 22.0)),
     )
 }
 
@@ -3179,6 +3613,109 @@ fn waterfall_image(waterfall: &VecDeque<Vec<f32>>, min_db: f32, max_db: f32) -> 
         }
     }
     image
+}
+
+/// Render an `ImageSnapshot` group's byte buffer into a `ColorImage`
+/// suitable for upload. Pixel format dispatch lives here so the GUI
+/// stays decoupled from the codec's internal byte layout.
+///
+/// For `Rgb565` we read big-endian as defined by Geoscan; for `Gray8`
+/// each byte becomes (B, G, R) = (v, v, v).
+fn render_image(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    group: &openhoshimi_codec::ImageGroup,
+) -> ColorImage {
+    let w = snapshot.width as usize;
+    let h = snapshot.height as usize;
+    let mut image = ColorImage::new([w, h], Color32::BLACK);
+    let bytes = &group.bytes;
+    match snapshot.pixel_format {
+        openhoshimi_codec::PixelFormat::Gray8 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if let Some(&v) = bytes.get(i) {
+                        image[(x, y)] = Color32::from_rgb(v, v, v);
+                    }
+                }
+            }
+        }
+        openhoshimi_codec::PixelFormat::Rgb565 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 2;
+                    if let (Some(&hi), Some(&lo)) = (bytes.get(i), bytes.get(i + 1)) {
+                        let v = u16::from_be_bytes([hi, lo]);
+                        let r = ((v >> 11) & 0x1f) as u8;
+                        let g = ((v >> 5) & 0x3f) as u8;
+                        let b = (v & 0x1f) as u8;
+                        image[(x, y)] =
+                            Color32::from_rgb(r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2);
+                    }
+                }
+            }
+        }
+        openhoshimi_codec::PixelFormat::Rgb888 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 3;
+                    if let (Some(&r), Some(&g), Some(&b)) =
+                        (bytes.get(i), bytes.get(i + 1), bytes.get(i + 2))
+                    {
+                        image[(x, y)] = Color32::from_rgb(r, g, b);
+                    }
+                }
+            }
+        }
+    }
+    image
+}
+
+/// Build a PNG-ready byte buffer for `group` using `snapshot`'s
+/// pixel format. Output layout matches the encoder header set by
+/// `save_image_png`: Gray8 → one byte per pixel, Rgb565/Rgb888 → 3
+/// bytes per pixel (R, G, B). Rgb565 is expanded to 8-bit by bit
+/// replication so the on-disk PNG looks identical to the canvas.
+fn encode_pixels_for_png(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    group: &openhoshimi_codec::ImageGroup,
+) -> Vec<u8> {
+    let w = snapshot.width as usize;
+    let h = snapshot.height as usize;
+    let bytes = &group.bytes;
+    match snapshot.pixel_format {
+        openhoshimi_codec::PixelFormat::Gray8 => {
+            let mut out = vec![0u8; w * h];
+            let copy_len = out.len().min(bytes.len());
+            out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            out
+        }
+        openhoshimi_codec::PixelFormat::Rgb565 => {
+            let mut out = vec![0u8; w * h * 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 2;
+                    if let (Some(&hi), Some(&lo)) = (bytes.get(i), bytes.get(i + 1)) {
+                        let v = u16::from_be_bytes([hi, lo]);
+                        let r = ((v >> 11) & 0x1f) as u8;
+                        let g = ((v >> 5) & 0x3f) as u8;
+                        let b = (v & 0x1f) as u8;
+                        let o = (y * w + x) * 3;
+                        out[o] = r << 3 | r >> 2;
+                        out[o + 1] = g << 2 | g >> 4;
+                        out[o + 2] = b << 3 | b >> 2;
+                    }
+                }
+            }
+            out
+        }
+        openhoshimi_codec::PixelFormat::Rgb888 => {
+            let mut out = vec![0u8; w * h * 3];
+            let copy_len = out.len().min(bytes.len());
+            out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            out
+        }
+    }
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
