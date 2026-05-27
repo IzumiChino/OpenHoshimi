@@ -5,12 +5,16 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use openhoshimi_codec::{Ax100Mode, Ax25Frame};
+use openhoshimi_codec::{Ax100Mode, Ax25Frame, GeoscanFrame};
 use openhoshimi_core::satellite::load_satellite;
 use openhoshimi_core::satellite::ModemDef;
 use openhoshimi_core::{Frame, InputSource, IoError, IqSample, IqSource};
+use openhoshimi_dsp::estimate_audio_carrier;
 use openhoshimi_dsp::linear::open_symbol_dump;
-use openhoshimi_io::{OggSource, WavIqSource, WavSource};
+use openhoshimi_io::{
+    detect_audio_mode_auto, open_audio_source, read_audio_prefix, read_iq_prefix,
+    AudioMode as IoAudioMode, MonoIqSource, WavIqSource, WavSource,
+};
 use openhoshimi_runtime::pipeline::{
     estimate_cpm_iq_frequency_offset_hz, estimate_iq_frequency_offset_hz, format_call, format_hex,
     format_timestamp, frame_type_label, infer_tuning_offset_hz, is_ao40_fec_downlink,
@@ -26,6 +30,29 @@ const READ_CHUNK: usize = 4096;
 struct Args {
     satellite_toml: PathBuf,
     input_wav: PathBuf,
+    /// How to interpret the input WAV: `auto` (sniff the file, default),
+    /// `iq` (force stereo I/Q), `fm` (FM-discriminator mono audio), or
+    /// `ssb` (single-sideband mono audio with `--audio-carrier-hz`
+    /// giving the signal centre frequency inside the audio band).
+    #[arg(long, value_enum, default_value_t = AudioMode::Auto)]
+    audio_mode: AudioMode,
+    /// Audio-band carrier frequency in Hz for `--audio-mode ssb`.
+    /// Ignored in any other mode.
+    #[arg(long)]
+    audio_carrier_hz: Option<f32>,
+}
+
+/// How the input file should be interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AudioMode {
+    /// Detect IQ vs mono audio from the file and the filename hint.
+    Auto,
+    /// Force stereo I/Q interpretation (errors if the file is mono).
+    Iq,
+    /// Force FM-discriminator mono audio (instantaneous-frequency waveform).
+    Fm,
+    /// Force SSB mono audio. Requires `--audio-carrier-hz`.
+    Ssb,
 }
 
 fn main() -> ExitCode {
@@ -79,91 +106,82 @@ fn run() -> Result<(), String> {
             PipelineRunner::FmAudio { source, pipeline }
         }
         InputKind::Iq => {
-            match WavIqSource::open(&args.input_wav) {
-                Err(_) => {
-                    // Mono file provided for an IQ downlink — fall back to FM audio path.
-                    eprintln!(
-                        "decode_file: mono input detected for IQ downlink, using FM audio path"
-                    );
+            let resolved_mode: IoAudioMode = match args.audio_mode {
+                AudioMode::Auto => detect_audio_mode_auto(&args.input_wav)?,
+                AudioMode::Iq => IoAudioMode::Iq,
+                AudioMode::Fm => IoAudioMode::Fm,
+                AudioMode::Ssb => IoAudioMode::Ssb,
+            };
+            match resolved_mode {
+                IoAudioMode::Fm => {
+                    eprintln!("decode_file: treating mono input as FM-discriminator audio");
                     let source: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
                     let sample_rate = source.sample_rate();
                     let mut pipeline = BitPipeline::<f32>::new(selected.downlink)?;
                     pipeline.configure_fm_audio_demodulator(selected.downlink, sample_rate)?;
                     PipelineRunner::FmAudio { source, pipeline }
                 }
-                Ok(mut source) => {
-                    let sample_rate = source.sample_rate();
-                    let prefix_len = sample_rate as usize * 8;
-                    let prefix = read_iq_prefix(&mut source, prefix_len)?;
-                    let scored = prepare_linear_iq_setup_scored(
-                        selected.downlink,
-                        sample_rate,
-                        &prefix,
-                        tuning_offset_hz,
-                    );
-                    let setup = scored.as_ref().map(|(setup, _)| setup.clone());
-                    let (downlink, tuning_offset_hz, pending) = if let Some(setup) = setup {
-                        let pending = if setup.sample_skip < prefix.len() {
-                            prefix.into_iter().skip(setup.sample_skip).collect()
-                        } else {
-                            Vec::new()
-                        };
-                        eprintln!(
-                            "decode_file: prefix setup: tuning={:.1} Hz skip={} prefix_frames={}",
-                            setup.tuning_offset_hz,
-                            setup.sample_skip,
-                            scored.as_ref().map_or(0, |(_, frames)| *frames),
+                IoAudioMode::Ssb => {
+                    if is_ao40_fec_downlink(selected.downlink) {
+                        return Err(
+                            "SSB audio mode does not support AO-40 FEC downlinks".to_string()
                         );
-                        if let Some(openhoshimi_core::satellite::ModemDef::Linear {
-                            differential,
-                            invert,
-                            swap_iq,
-                            ..
-                        }) = setup.downlink.modem.as_ref()
-                        {
-                            eprintln!(
-                                "decode_file: prefix polarity: differential={differential} invert={invert} swap_iq={swap_iq}",
-                            );
-                        }
-                        (setup.downlink, setup.tuning_offset_hz, pending)
-                    } else {
-                        let downlink = selected.downlink.clone();
-                        let mut tuning = tuning_offset_hz;
-                        if matches!(downlink.modem, Some(ModemDef::Cpm { .. })) {
-                            let estimate =
-                                estimate_cpm_iq_frequency_offset_hz(&prefix, sample_rate)
-                                    .or_else(|| {
-                                        estimate_iq_frequency_offset_hz(&prefix, sample_rate)
-                                    })
-                                    .filter(|v| v.is_finite());
-                            if let Some(estimate) = estimate {
-                                eprintln!(
-                                    "decode_file: cpm carrier estimate from prefix: {estimate:.1} Hz (filename hint: {tuning:.1} Hz)",
-                                );
-                                tuning = estimate;
+                    }
+                    let mut mono: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
+                    let sample_rate = mono.sample_rate();
+                    let (carrier_hz, prefix) = match args.audio_carrier_hz {
+                        Some(value) => {
+                            if !value.is_finite() {
+                                return Err(format!(
+                                    "--audio-carrier-hz must be finite, got {value}"
+                                ));
                             }
+                            eprintln!(
+                                "decode_file: treating mono input as SSB audio, mixing carrier {value:.1} Hz to baseband (user-supplied)"
+                            );
+                            (value, Vec::new())
                         }
-                        (downlink, tuning, prefix)
+                        None => {
+                            let nyquist = sample_rate as f32 / 2.0;
+                            if nyquist <= 400.0 {
+                                return Err(format!(
+                                    "SSB audio carrier auto-estimate: sample rate {sample_rate} Hz is too low"
+                                ));
+                            }
+                            let prefix_len = sample_rate as usize;
+                            let prefix = read_audio_prefix(&mut *mono, prefix_len)?;
+                            let estimate = estimate_audio_carrier(
+                                &prefix,
+                                sample_rate,
+                                200.0,
+                                nyquist - 200.0,
+                            )
+                            .ok_or_else(|| {
+                                "SSB audio carrier auto-estimate failed: no peak found in audio band; pass --audio-carrier-hz <hz>".to_string()
+                            })?;
+                            let prefix_samples = prefix.len();
+                            eprintln!(
+                                "decode_file: treating mono input as SSB audio, mixing carrier {estimate:.1} Hz to baseband (auto-estimated from {prefix_samples} samples)"
+                            );
+                            (estimate, prefix)
+                        }
                     };
-                    if is_ao40_fec_downlink(&downlink) {
-                        eprintln!("decode_file: using soft-decision Viterbi path for AO-40 FEC");
-                        let pipeline =
-                            SoftAo40Pipeline::new(&downlink, sample_rate, tuning_offset_hz)?;
-                        PipelineRunner::IqSoftAo40 {
-                            source,
-                            pipeline: Box::new(pipeline),
-                            pending,
-                        }
-                    } else {
-                        let mut pipeline = BitPipeline::<IqSample>::new(&downlink)?;
-                        pipeline.configure_demodulator(&downlink, sample_rate, tuning_offset_hz)?;
-                        PipelineRunner::Iq {
-                            source,
-                            pipeline,
-                            pending,
-                        }
+                    let source: Box<dyn IqSource> =
+                        Box::new(MonoIqSource::with_prefix(mono, prefix));
+                    let mut pipeline = BitPipeline::<IqSample>::new(selected.downlink)?;
+                    pipeline.configure_demodulator(selected.downlink, sample_rate, carrier_hz)?;
+                    PipelineRunner::Iq {
+                        source,
+                        pipeline,
+                        pending: Vec::new(),
                     }
                 }
+                IoAudioMode::Iq => {
+                    let source = WavIqSource::open(&args.input_wav)
+                        .map_err(|err| format!("failed to open WAV as IQ: {err}"))?;
+                    build_iq_runner(source, selected.downlink, tuning_offset_hz)?
+                }
+                IoAudioMode::Auto => unreachable!("IoAudioMode::Auto is resolved above"),
             }
         }
     };
@@ -212,6 +230,34 @@ fn run() -> Result<(), String> {
 
     if let Some(err) = runner.last_framer_error() {
         eprintln!("decode_file: last discarded HDLC frame: {err}");
+        if let Some(bytes) = runner.last_failed_bytes() {
+            eprintln!(
+                "decode_file: last discarded HDLC bytes ({} bytes): {}",
+                bytes.len(),
+                bytes
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        if let Some(longest) = runner.longest_failed_bytes() {
+            let same_as_last = runner
+                .last_failed_bytes()
+                .map(|last| last == longest)
+                .unwrap_or(false);
+            if !same_as_last {
+                eprintln!(
+                    "decode_file: longest discarded HDLC bytes ({} bytes): {}",
+                    longest.len(),
+                    longest
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
     }
     if let Some(distance) = runner.best_sync_distance() {
         eprintln!("decode_file: run summary: frames={frame_count} best_sync_distance={distance}");
@@ -246,7 +292,7 @@ enum PipelineRunner {
         pipeline: BitPipeline<f32>,
     },
     Iq {
-        source: WavIqSource,
+        source: Box<dyn IqSource>,
         pipeline: BitPipeline<IqSample>,
         pending: Vec<IqSample>,
     },
@@ -399,6 +445,24 @@ impl PipelineRunner {
         }
     }
 
+    fn last_failed_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Audio { pipeline, .. } => pipeline.last_failed_bytes(),
+            Self::FmAudio { pipeline, .. } => pipeline.last_failed_bytes(),
+            Self::Iq { pipeline, .. } => pipeline.last_failed_bytes(),
+            Self::IqSoftAo40 { .. } => None,
+        }
+    }
+
+    fn longest_failed_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Audio { pipeline, .. } => pipeline.longest_failed_bytes(),
+            Self::FmAudio { pipeline, .. } => pipeline.longest_failed_bytes(),
+            Self::Iq { pipeline, .. } => pipeline.longest_failed_bytes(),
+            Self::IqSoftAo40 { .. } => None,
+        }
+    }
+
     fn best_sync_distance(&self) -> Option<usize> {
         match self {
             Self::Audio { pipeline, .. } => pipeline.best_sync_distance(),
@@ -414,24 +478,6 @@ impl PipelineRunner {
             Self::IqSoftAo40 { pipeline, .. } => Some(pipeline.distance_history()),
         }
     }
-}
-
-fn read_iq_prefix(source: &mut dyn IqSource, len: usize) -> Result<Vec<IqSample>, String> {
-    let mut prefix = Vec::with_capacity(len);
-    let mut buf = [IqSample::default(); READ_CHUNK];
-    while prefix.len() < len {
-        let read = match source.read_samples(&mut buf) {
-            Ok(read) => read,
-            Err(IoError::EndOfStream) => break,
-            Err(err) => return Err(format!("failed to prime IQ WAV input: {err}")),
-        };
-        if read == 0 {
-            break;
-        }
-        let remaining = len - prefix.len();
-        prefix.extend_from_slice(&buf[..read.min(remaining)]);
-    }
-    Ok(prefix)
 }
 
 fn print_decoded_frame(
@@ -474,6 +520,10 @@ fn print_decoded_frame(
             println!("      raw: {}", format_hex(raw));
             print_telemetry_fields(telemetry, &payload);
         }
+        DecodedFrame::Geoscan(geoscan) => {
+            print_geoscan_frame(index, timestamp, &geoscan, raw);
+            print_telemetry_fields(telemetry, &geoscan.payload);
+        }
         DecodedFrame::Raw {
             frame_type,
             raw_len,
@@ -487,6 +537,35 @@ fn print_decoded_frame(
             print_telemetry_fields(telemetry, raw);
         }
     }
+}
+
+fn print_geoscan_frame(index: usize, timestamp: Duration, frame: &GeoscanFrame, raw: &[u8]) {
+    let crc_status = if frame.crc_ok { "CRC ok" } else { "CRC FAIL" };
+    println!(
+        "#{index:03}  {}  GEOSCAN              [{crc_status}]  {} bytes  crc_rx={:#06x}  crc_calc={:#06x}",
+        format_timestamp(timestamp),
+        frame.payload.len(),
+        frame.crc_received,
+        frame.crc_expected,
+    );
+    if !raw.is_empty() {
+        println!("      raw:     {}", format_hex(raw));
+    }
+    println!("      payload: {}", format_hex(&frame.payload));
+    println!("      ascii:   {}", format_ascii(&frame.payload));
+}
+
+fn format_ascii(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| {
+            if (0x20..=0x7e).contains(b) {
+                *b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 fn print_ax25_frame(index: usize, timestamp: Duration, frame: &Ax25Frame, raw: &[u8]) {
@@ -552,22 +631,76 @@ fn format_float(value: f64) -> String {
     text
 }
 
-/// Open a mono audio source from a WAV or OGG file, based on extension.
-fn open_audio_source(path: &Path) -> Result<Box<dyn InputSource>, String> {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        "ogg" => {
-            let source =
-                OggSource::open(path).map_err(|err| format!("failed to open OGG file: {err}"))?;
-            Ok(Box::new(source))
+/// Build the IQ-mode `PipelineRunner` for a real stereo IQ WAV source.
+///
+/// Owns the prefix scan, polarity/skew alignment, and CPM carrier
+/// estimation that the IQ path uses to lock onto a recording.
+fn build_iq_runner(
+    mut source: WavIqSource,
+    downlink_in: &openhoshimi_core::satellite::DownlinkDef,
+    tuning_offset_hz: f32,
+) -> Result<PipelineRunner, String> {
+    let sample_rate = source.sample_rate();
+    let prefix_len = sample_rate as usize * 8;
+    let prefix = read_iq_prefix(&mut source, prefix_len)?;
+    let scored =
+        prepare_linear_iq_setup_scored(downlink_in, sample_rate, &prefix, tuning_offset_hz);
+    let setup = scored.as_ref().map(|(setup, _)| setup.clone());
+    let (downlink, tuning_offset_hz, pending) = if let Some(setup) = setup {
+        let pending = if setup.sample_skip < prefix.len() {
+            prefix.into_iter().skip(setup.sample_skip).collect()
+        } else {
+            Vec::new()
+        };
+        eprintln!(
+            "decode_file: prefix setup: tuning={:.1} Hz skip={} prefix_frames={}",
+            setup.tuning_offset_hz,
+            setup.sample_skip,
+            scored.as_ref().map_or(0, |(_, frames)| *frames),
+        );
+        if let Some(openhoshimi_core::satellite::ModemDef::Linear {
+            differential,
+            invert,
+            swap_iq,
+            ..
+        }) = setup.downlink.modem.as_ref()
+        {
+            eprintln!(
+                "decode_file: prefix polarity: differential={differential} invert={invert} swap_iq={swap_iq}",
+            );
         }
-        _ => {
-            let source =
-                WavSource::open(path).map_err(|err| format!("failed to open WAV file: {err}"))?;
-            Ok(Box::new(source))
+        (setup.downlink, setup.tuning_offset_hz, pending)
+    } else {
+        let downlink = downlink_in.clone();
+        let mut tuning = tuning_offset_hz;
+        if matches!(downlink.modem, Some(ModemDef::Cpm { .. })) {
+            let estimate = estimate_cpm_iq_frequency_offset_hz(&prefix, sample_rate)
+                .or_else(|| estimate_iq_frequency_offset_hz(&prefix, sample_rate))
+                .filter(|v| v.is_finite());
+            if let Some(estimate) = estimate {
+                eprintln!(
+                    "decode_file: cpm carrier estimate from prefix: {estimate:.1} Hz (filename hint: {tuning:.1} Hz)",
+                );
+                tuning = estimate;
+            }
         }
+        (downlink, tuning, prefix)
+    };
+    if is_ao40_fec_downlink(&downlink) {
+        eprintln!("decode_file: using soft-decision Viterbi path for AO-40 FEC");
+        let pipeline = SoftAo40Pipeline::new(&downlink, sample_rate, tuning_offset_hz)?;
+        Ok(PipelineRunner::IqSoftAo40 {
+            source,
+            pipeline: Box::new(pipeline),
+            pending,
+        })
+    } else {
+        let mut pipeline = BitPipeline::<IqSample>::new(&downlink)?;
+        pipeline.configure_demodulator(&downlink, sample_rate, tuning_offset_hz)?;
+        Ok(PipelineRunner::Iq {
+            source: Box::new(source),
+            pipeline,
+            pending,
+        })
     }
 }
