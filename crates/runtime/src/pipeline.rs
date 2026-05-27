@@ -851,6 +851,12 @@ pub struct PipelineStats {
     /// Number of times the framer has locked onto the syncword. `None`
     /// for non-syncword framers (HDLC).
     pub sync_locked: Option<u64>,
+    /// Number of decoded frames whose codec-level CRC matched the
+    /// transmitted CRC. `None` for codecs without a CRC step.
+    pub crc_ok: Option<u64>,
+    /// Number of decoded frames whose codec-level CRC mismatched. `None`
+    /// for codecs without a CRC step.
+    pub crc_fail: Option<u64>,
 }
 
 /// Hard-decision pipeline from samples to decoded frames.
@@ -866,6 +872,8 @@ where
     total_samples: u64,
     total_bits: u64,
     frames_emitted: u64,
+    crc_ok: u64,
+    crc_fail: u64,
 }
 
 impl BitPipeline<f32> {
@@ -939,6 +947,8 @@ where
             total_samples: 0,
             total_bits: 0,
             frames_emitted: 0,
+            crc_ok: 0,
+            crc_fail: 0,
         })
     }
 
@@ -965,6 +975,21 @@ where
     /// Decode a framed payload.
     pub fn decode_frame(&self, frame: &Frame) -> Result<DecodedFrame, String> {
         self.codec.decode(frame)
+    }
+
+    /// Record the CRC outcome of a decoded frame.
+    ///
+    /// Callers tap this once per frame after `decode_frame` succeeds, so
+    /// the pipeline can surface a CRC pass / fail rate alongside the
+    /// other live counters. Only meaningful when the codec stage carries
+    /// a CRC notion (Geoscan today); the `pipeline_stats()` view hides
+    /// the counters when the codec has no CRC step.
+    pub fn record_crc(&mut self, ok: bool) {
+        if ok {
+            self.crc_ok = self.crc_ok.saturating_add(1);
+        } else {
+            self.crc_fail = self.crc_fail.saturating_add(1);
+        }
     }
 
     /// Number of input samples processed by this pipeline.
@@ -997,12 +1022,15 @@ where
 
     /// Snapshot of per-stage counters for live diagnostics.
     pub fn pipeline_stats(&self) -> PipelineStats {
+        let codec_has_crc = matches!(self.codec, CodecStage::Geoscan(_));
         PipelineStats {
             samples_in: self.total_samples,
             total_bits: self.total_bits,
             frames_emitted: self.frames_emitted,
             sync_attempts: self.framer.sync_attempts(),
             sync_locked: self.framer.sync_locked(),
+            crc_ok: codec_has_crc.then_some(self.crc_ok),
+            crc_fail: codec_has_crc.then_some(self.crc_fail),
         }
     }
 }

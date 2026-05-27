@@ -1126,6 +1126,17 @@ impl OpenHoshimiApp {
                     &format!("emit: {}", stats.frames_emitted),
                     Palette::MUTED,
                 );
+                if let (Some(crc_ok), Some(crc_fail)) = (stats.crc_ok, stats.crc_fail) {
+                    let total = crc_ok.saturating_add(crc_fail);
+                    let color = if total == 0 {
+                        Palette::MUTED
+                    } else if crc_ok.saturating_mul(2) >= total {
+                        Palette::GREEN
+                    } else {
+                        Palette::RED
+                    };
+                    status_segment(ui, &format!("crc: {}/{}", crc_ok, total), color);
+                }
             }
             if !self.status.is_empty() {
                 let status_lower = self.status.to_ascii_lowercase();
@@ -2926,7 +2937,7 @@ fn emit_frames<P>(
     satellite: &SatelliteDefinition,
     telemetry: Option<&SchemaParser>,
     start: &Instant,
-    pipeline: &BitPipeline<P>,
+    pipeline: &mut BitPipeline<P>,
     count: &mut usize,
     frames: Vec<CoreFrame>,
 ) where
@@ -2941,8 +2952,18 @@ fn emit_frames<P>(
         // to decode once more here to recover the descrambled payload.
         // Decoding is cheap (PN9 + CRC compare) and fires only when the
         // codec stage is Geoscan to begin with.
+        //
+        // Image payload tap is gated on crc_ok: with threshold = 4 the
+        // syncword framer produces a non-trivial number of false locks
+        // whose 64-byte payload is essentially noise after PN9; letting
+        // those through corrupts the canvas. CRC mismatch on a real
+        // image chunk also indicates at least one bit error in the
+        // 56-byte payload, which is far worse than a missing chunk.
         if let Ok(DecodedFrame::Geoscan(ref geoscan)) = pipeline.decode_frame(&frame) {
-            let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+            pipeline.record_crc(geoscan.crc_ok);
+            if geoscan.crc_ok {
+                let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+            }
         }
         let row = frame_row(*count, start.elapsed(), pipeline, &frame, telemetry);
         match row {
