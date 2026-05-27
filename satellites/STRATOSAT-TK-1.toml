@@ -4,16 +4,31 @@
 #            https://db.satnogs.org/satellite/57167
 #
 # Russian 3U CubeSat developed by Sirius University and StratoNautica,
-# launched 2023-06-27 on Soyuz-2.1b alongside Geoscan-Edelweiss. Carries
-# an amateur 9k6 GMSK telemetry beacon on 435.4745 MHz with classical
-# AX.25 framing. The bit-stream is NRZ-I encoded after the GMSK modem
-# and pre-scrambled with the G3RUH self-synchronising descrambler, the
-# common combination used by KISS / soundmodem-compatible TNCs.
+# launched 2023-06-27 on Soyuz-2.1b. Carries an amateur 9k6 telemetry
+# beacon on 435.4745 MHz.
 #
-# Telemetry interpretation is intentionally omitted here: the StratoSat
-# beacon payload format is mission-specific and is not yet wired up in
-# this crate. The decode chain stops at the AX.25 codec, surfacing the
-# unstuffed + FCS-validated payload bytes for downstream handling.
+# The radio is a TI CC1125 transceiver running its hardware fixed-packet
+# mode: preamble + 32-bit syncword + fixed-length payload + CRC, with
+# the chip's PN9 data whitening engine enabled. The on-air chain is the
+# same Geoscan custom format used by sister satellite Geoscan-Edelveis,
+# matching gr-satellites' `stratosat_tk1` flowgraph:
+#
+#   1. Preamble 0xAAAAAAAA (handled by the bit-clock).
+#   2. 32-bit syncword 0x930B51DE (handled by SyncwordFramer).
+#   3. 64-byte payload, whitened with the CC11xx PN9 sequence.
+#   4. 2-byte CC11xx CRC-16 (poly 0x8005, init 0xFFFF, MSB-first), also
+#      whitened, computed over the unwhitened 64-byte payload.
+#
+# There is NO HDLC, NO bit-stuffing, and NO AX.25 here — the earlier
+# definition that wrapped this beacon in AX.25 + G3RUH was incorrect.
+# AX.25 framing on this satellite was an artefact of HDLC flag bytes
+# being randomly hit inside the (different) PN9-whitened payload.
+#
+# Telemetry interpretation is intentionally omitted: the StratoSat
+# beacon payload format is mission-specific and not yet wired up. The
+# decode chain stops at the Geoscan codec, which surfaces the
+# unwhitened 64-byte payload + CRC validity flag for downstream
+# inspection.
 
 [satellite]
 name = "StratoSat TK-1"
@@ -21,28 +36,36 @@ aliases = ["STRATOSAT-TK-1", "STRATOSAT TK-1", "STRATOSAT TK1", "RS52S"]
 norad_id = 57167
 
 [[downlink]]
-label = "9k6 GMSK AX.25 telemetry beacon"
+label = "9k6 GFSK Geoscan-format telemetry beacon"
 freq_hz = 435_474_500
 modulation = "GMSK"
 baudrate = 9600
-framing = "AX25"
+framing = "GEOSCAN"
 
 [downlink.modem]
 kind = "cpm"
 mode = "gmsk"
-# Standard amateur GMSK at h = 0.5 and BT = 0.5.
+# Standard amateur 9k6 GMSK at h = 0.5 and BT = 0.5. CC1125 datasheet
+# allows configurable deviation; the on-air signal observed in SoundModem
+# matches h = 0.5.
 modulation_index = 0.5
 gaussian_bt = 0.5
-frequency_offset_hz = -450_000.0
+frequency_offset_hz = 0.0
 differential = false
 invert = false
 swap_iq = false
 
-[downlink.descrambler]
-kind = "g3ruh"
-
 [downlink.framer]
-kind = "hdlc"
+kind = "syncword"
+# CC1125 syncword 0x930B51DE, MSB-first.
+syncword = "10010011000010110101000111011110"
+# Tolerate up to 2 bit errors in the 32-bit syncword.
+threshold = 2
+# Fixed 66-byte block: 64-byte payload + 2-byte CRC.
+payload_bits = 528
 
 [downlink.codec]
-kind = "ax25"
+# Runs the CC11xx PN9 descrambler over the 66-byte block and verifies
+# the trailing CRC-16. The PN9 LFSR is reset per frame, mirroring CC1125
+# hardware whitening which restarts on the first byte after the syncword.
+kind = "geoscan"
