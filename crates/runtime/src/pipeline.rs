@@ -7,6 +7,7 @@ use rayon::prelude::*;
 
 use openhoshimi_codec::{
     ax100_syncword, Ao40FecDecoder, Ax100Decoder, Ax100Mode, Ax25Decoder, Ax25Frame, Callsign,
+    GeoscanDecoder, GeoscanFrame,
 };
 use openhoshimi_core::satellite::{
     Ax100ModeDef, CodecDef, CpmModeDef, DescramblerDef, DownlinkDef, FramerDef, LineCodingDef,
@@ -91,6 +92,8 @@ pub enum DecodedFrame {
         /// Number of corrected Reed-Solomon bytes.
         corrected_errors: usize,
     },
+    /// Geoscan custom frame (CC11xx PN9-descrambled fixed-size payload).
+    Geoscan(GeoscanFrame),
     /// Raw frame bytes from an unsupported codec.
     Raw {
         /// Raw frame type.
@@ -181,6 +184,7 @@ pub fn frame_type_label(frame_type: FrameType) -> &'static str {
         FrameType::GomspaceAx100 => "ax100",
         FrameType::Ccsds => "ccsds",
         FrameType::Fx25 => "fx25",
+        FrameType::Geoscan => "geoscan",
         FrameType::Unknown => "unknown",
     }
 }
@@ -192,6 +196,7 @@ pub fn frame_type_for_codec(downlink: &DownlinkDef) -> FrameType {
         Some(CodecKind::Ao40Fec) => FrameType::Ao40Fec,
         Some(CodecKind::GomspaceAx100(_)) => FrameType::GomspaceAx100,
         Some(CodecKind::Ccsds) => FrameType::Ccsds,
+        Some(CodecKind::Geoscan) => FrameType::Geoscan,
         Some(CodecKind::Unknown) | None => FrameType::Unknown,
     }
 }
@@ -942,6 +947,19 @@ where
         self.framer.last_error()
     }
 
+    /// Raw byte buffer of the most recent frame that failed validation.
+    /// Currently only HDLC frames carry this for diagnostic comparison.
+    pub fn last_failed_bytes(&self) -> Option<&[u8]> {
+        self.framer.last_failed_bytes()
+    }
+
+    /// Raw byte buffer of the longest frame that failed validation across
+    /// the entire stream. Useful when the most recent failure is a short
+    /// tail fragment that overwrites the diagnostically interesting one.
+    pub fn longest_failed_bytes(&self) -> Option<&[u8]> {
+        self.framer.longest_failed_bytes()
+    }
+
     /// Best AO-40 sync distance observed by the active framer, if any.
     pub fn best_sync_distance(&self) -> Option<usize> {
         self.framer.best_sync_distance()
@@ -1174,6 +1192,20 @@ impl FrameStage {
         }
     }
 
+    fn last_failed_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Hdlc(framer) => framer.last_failed_bytes(),
+            Self::Ao40(_) | Self::Syncword(_) => None,
+        }
+    }
+
+    fn longest_failed_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Hdlc(framer) => framer.longest_failed_bytes(),
+            Self::Ao40(_) | Self::Syncword(_) => None,
+        }
+    }
+
     fn best_sync_distance(&self) -> Option<usize> {
         match self {
             Self::Ao40(framer) => framer.best_sync_distance(),
@@ -1285,6 +1317,7 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
         })),
         Some(CodecDef::Unknown) => Some(CodecKind::Unknown),
         Some(CodecDef::Ccsds) => Some(CodecKind::Ccsds),
+        Some(CodecDef::Geoscan) => Some(CodecKind::Geoscan),
         Some(CodecDef::Fx25) => None,
         None if matches_token(&downlink.framing, &["AX25", "AX.25", "HDLC"]) => {
             Some(CodecKind::Ax25)
@@ -1293,6 +1326,7 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
         None if downlink.framing.eq_ignore_ascii_case("GOMSPACE_AX100") => {
             Some(CodecKind::GomspaceAx100(Ax100Mode::AsmGolay))
         }
+        None if downlink.framing.eq_ignore_ascii_case("GEOSCAN") => Some(CodecKind::Geoscan),
         None if downlink.framing.eq_ignore_ascii_case("UNKNOWN") => Some(CodecKind::Unknown),
         None => None,
     }
@@ -1303,6 +1337,7 @@ enum CodecKind {
     Ao40Fec,
     GomspaceAx100(Ax100Mode),
     Ccsds,
+    Geoscan,
     Unknown,
 }
 
@@ -1314,6 +1349,7 @@ enum CodecStage {
         mode: Ax100Mode,
     },
     Ccsds,
+    Geoscan(GeoscanDecoder),
     Unknown,
 }
 
@@ -1347,6 +1383,12 @@ impl CodecStage {
                     corrected_errors: frame.corrected_errors,
                 })
             }
+            Self::Geoscan(decoder) => {
+                let geoscan = decoder
+                    .decode_frame(frame)
+                    .map_err(|err| format!("Geoscan decode failed: {err}"))?;
+                Ok(DecodedFrame::Geoscan(geoscan))
+            }
             Self::Ccsds | Self::Unknown => Ok(DecodedFrame::Raw {
                 frame_type: frame.frame_type,
                 raw_len: frame.raw.len(),
@@ -1364,6 +1406,7 @@ fn build_codec(downlink: &DownlinkDef) -> Result<CodecStage, String> {
             mode,
         }),
         Some(CodecKind::Ccsds) => Ok(CodecStage::Ccsds),
+        Some(CodecKind::Geoscan) => Ok(CodecStage::Geoscan(GeoscanDecoder::new())),
         Some(CodecKind::Unknown) => Ok(CodecStage::Unknown),
         None => Err(format!("{} has no supported codec", downlink.label)),
     }
