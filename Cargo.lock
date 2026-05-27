@@ -902,6 +902,7 @@ name = "cpm_dump"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crc",
  "openhoshimi-core",
  "openhoshimi-dsp",
  "openhoshimi-io",

@@ -17,3 +17,4 @@ openhoshimi-core = { workspace = true }
 openhoshimi-io = { workspace = true }
 openhoshimi-dsp = { workspace = true }
 clap = { workspace = true }
+crc = { workspace = true }
