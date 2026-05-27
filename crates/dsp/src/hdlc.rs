@@ -16,6 +16,12 @@ const MIN_AX25_PAYLOAD_LEN: usize = 17;
 const FCS_LEN: usize = 2;
 const AX25_FCS: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
 
+/// Result of validating a candidate HDLC frame: the raw byte buffer
+/// (post-unstuff, including FCS) plus the validation result. Decode errors
+/// keep the buffer attached so callers can diagnose CRC failures by hex
+/// comparison against a reference decoder.
+type HdlcCandidate = (Vec<u8>, Result<Vec<u8>, DecodeError>);
+
 /// HDLC framer for Bell 202 / AX.25 bit streams.
 pub struct HdlcFramer {
     shift_register: u8,
@@ -23,6 +29,15 @@ pub struct HdlcFramer {
     raw_bits: Vec<u8>,
     /// Last decode error, if a candidate frame failed validation.
     pub last_error: Option<DecodeError>,
+    /// Raw bytes (after bit-unstuffing) of the most recent frame that failed
+    /// validation. Useful for diagnosing CRC mismatches against a reference
+    /// decoder by inspecting the candidate payload.
+    pub last_failed_bytes: Option<Vec<u8>>,
+    /// Raw bytes of the longest failed candidate observed across the entire
+    /// stream. The most recent failure is often a short tail fragment that
+    /// overwrites the more interesting full-length frame, so we keep the
+    /// longest one separately for offline diff against a reference decoder.
+    pub longest_failed_bytes: Option<Vec<u8>>,
 }
 
 impl HdlcFramer {
@@ -33,6 +48,8 @@ impl HdlcFramer {
             in_frame: false,
             raw_bits: Vec::new(),
             last_error: None,
+            last_failed_bytes: None,
+            longest_failed_bytes: None,
         }
     }
 
@@ -41,7 +58,20 @@ impl HdlcFramer {
         self.last_error.as_ref()
     }
 
-    fn push_bit(&mut self, bit: u8) -> Option<Result<Vec<u8>, DecodeError>> {
+    /// Return the raw byte buffer of the most recent failed frame, if any.
+    pub fn last_failed_bytes(&self) -> Option<&[u8]> {
+        self.last_failed_bytes.as_deref()
+    }
+
+    /// Return the raw byte buffer of the longest failed frame seen so far,
+    /// if any. Useful when the most recent failure is a short tail fragment
+    /// and the diagnostically interesting candidate has a length matching a
+    /// reference decoder.
+    pub fn longest_failed_bytes(&self) -> Option<&[u8]> {
+        self.longest_failed_bytes.as_deref()
+    }
+
+    fn push_bit(&mut self, bit: u8) -> Option<HdlcCandidate> {
         let bit = bit & 1;
         self.shift_register = (self.shift_register >> 1) | (bit << 7);
 
@@ -70,11 +100,12 @@ impl HdlcFramer {
         None
     }
 
-    fn decode_candidate(bits: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    fn decode_candidate(bits: &[u8]) -> HdlcCandidate {
         let unstuffed = unstuff_bits(bits);
         let bytes = bits_to_bytes(&unstuffed);
         if bytes.len() < MIN_AX25_PAYLOAD_LEN + FCS_LEN {
-            return Err(DecodeError::TooShort(bytes.len().saturating_sub(FCS_LEN)));
+            let len = bytes.len().saturating_sub(FCS_LEN);
+            return (bytes, Err(DecodeError::TooShort(len)));
         }
 
         let payload_len = bytes.len() - FCS_LEN;
@@ -82,14 +113,14 @@ impl HdlcFramer {
         let received = u16::from_le_bytes([bytes[payload_len], bytes[payload_len + 1]]);
         let calculated = AX25_FCS.checksum(payload);
         if calculated != received {
-            return Err(DecodeError::CrcMismatch);
+            return (bytes.clone(), Err(DecodeError::CrcMismatch));
         }
 
         if payload.len() < MIN_AX25_PAYLOAD_LEN {
-            return Err(DecodeError::TooShort(payload.len()));
+            return (bytes.clone(), Err(DecodeError::TooShort(payload.len())));
         }
 
-        Ok(payload.to_vec())
+        (bytes.clone(), Ok(payload.to_vec()))
     }
 }
 
@@ -104,10 +135,11 @@ impl Framing for HdlcFramer {
         let mut frames = Vec::new();
 
         for &byte in bytes {
-            if let Some(result) = self.push_bit(byte) {
+            if let Some((candidate_bytes, result)) = self.push_bit(byte) {
                 match result {
                     Ok(raw) => {
                         self.last_error = None;
+                        self.last_failed_bytes = None;
                         frames.push(Frame {
                             satellite_id: 0,
                             timestamp: SystemTime::now(),
@@ -118,6 +150,15 @@ impl Framing for HdlcFramer {
                     }
                     Err(err) => {
                         self.last_error = Some(err);
+                        let longest_len = self
+                            .longest_failed_bytes
+                            .as_ref()
+                            .map(|b| b.len())
+                            .unwrap_or(0);
+                        if candidate_bytes.len() > longest_len {
+                            self.longest_failed_bytes = Some(candidate_bytes.clone());
+                        }
+                        self.last_failed_bytes = Some(candidate_bytes);
                     }
                 }
             }
@@ -243,5 +284,7 @@ mod tests {
             framer.last_error(),
             Some(DecodeError::CrcMismatch)
         ));
+        assert!(framer.last_failed_bytes().is_some());
+        assert!(framer.longest_failed_bytes().is_some());
     }
 }
