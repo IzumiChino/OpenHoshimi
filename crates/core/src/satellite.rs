@@ -327,6 +327,9 @@ pub enum CodecDef {
     Ccsds,
     /// FX.25 frame decoder placeholder.
     Fx25,
+    /// Geoscan custom frame decoder (CC11xx PN9 descrambling +
+    /// CC11xx CRC16 over a fixed-size payload).
+    Geoscan,
     /// Unknown or unsupported frame decoder.
     Unknown,
 }

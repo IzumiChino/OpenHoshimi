@@ -182,6 +182,9 @@ pub enum FrameType {
     Ccsds,
     /// FX.25 (AX.25 wrapped in a Reed-Solomon outer code).
     Fx25,
+    /// Geoscan custom CC11xx frame format (32-bit syncword + fixed-size
+    /// payload + CRC, hardware-whitened with PN9).
+    Geoscan,
     /// Frame whose framing is unknown or not yet classified.
     Unknown,
 }
