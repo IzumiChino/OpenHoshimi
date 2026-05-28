@@ -54,3 +54,49 @@ payload_bits = 488
 
 [downlink.codec]
 kind = "ccsds"
+
+# ----------------------------------------------------------------------------
+# 9k6 GMSK SSDV image downlink.
+#
+# Parameters supplied by the HyacinthSat team's internal test
+# reference (no public document at the time of writing): 435.400 MHz,
+# 9600 bd GMSK with modulation index h = 0.5 and Gaussian BT = 0.5,
+# 128 bytes of 0x55 preamble, then `n * (0x1ACFFC1D + 256-byte SSDV
+# packet)`. No line coding, no scrambling, MSB-first within each byte.
+#
+# Each 256-byte payload is a complete SSDV packet (sync byte + base-40
+# callsign + image_id + packet_id + width + height + JPEG MCU slice +
+# CRC32 + 32-byte Reed-Solomon parity for the FEC variant). The
+# reassembler stitches packets into a JPEG by image_id.
+[[downlink]]
+label = "9k6 GMSK SSDV image"
+freq_hz = 435_400_000
+modulation = "GMSK"
+baudrate = 9600
+framing = "CCSDS"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.framer]
+kind = "syncword"
+# CCSDS attached sync marker 0x1ACFFC1D, MSB-first.
+syncword = "00011010110011111111110000011101"
+# Same 2-bit tolerance as the telemetry beacon — this matches the
+# reference Python decoder used to validate Hyacinth-1.
+threshold = 2
+# Each frame carries one 256-byte SSDV packet (8 * 256 = 2048 bits).
+payload_bits = 2048
+
+[downlink.codec]
+kind = "ssdv"
+
+[downlink.image]
+protocol = "ssdv"

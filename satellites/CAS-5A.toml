@@ -1,0 +1,78 @@
+# CAMSAT CAS-5A satellite definition.
+#
+# Reference: https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#            https://www.amsat.org/news/2022/12/30/cas-5a-launched/
+#            https://amsat-uk.org/satellites/comms/camsat-cas-5a/
+#
+# Chinese 6U CubeSat from CAMSAT, launched 2022-12-29 on Long March 11.
+# Carries an HF-to-V/U linear transponder, a U/V FM repeater, a CW
+# beacon, and 4k8 / 9k6 GMSK telemetry beacons on 435.650 MHz, all of
+# which use AX.25 wrapped in G3RUH scrambling.
+#
+# We declare both baudrate variants as separate `[[downlink]]` rows so
+# the GUI / decode_file picker can match whichever a recording carries;
+# the linear transponder and FM repeater are out of scope here (no
+# narrowband voice decoder yet).
+
+[satellite]
+name = "CAS-5A"
+aliases = ["CAMSAT CAS-5A", "FUNCUBE-CN", "CAS5A"]
+norad_id = 54684
+
+[[downlink]]
+label = "4k8 GMSK telemetry beacon"
+freq_hz = 435_650_000
+modulation = "GMSK"
+baudrate = 4800
+framing = "AX25"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.line_coding]
+kind = "nrzi"
+
+[downlink.descrambler]
+kind = "g3ruh"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"
+
+[[downlink]]
+label = "9k6 GMSK telemetry beacon"
+freq_hz = 435_650_000
+modulation = "GMSK"
+baudrate = 9600
+framing = "AX25"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.line_coding]
+kind = "nrzi"
+
+[downlink.descrambler]
+kind = "g3ruh"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"

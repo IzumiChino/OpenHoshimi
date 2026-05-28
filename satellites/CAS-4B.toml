@@ -1,0 +1,44 @@
+# CAMSAT CAS-4B satellite definition.
+#
+# Reference: https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#            https://www.amsat.org/two-way-satellites/cas-4a-and-cas-4b/
+#            https://amsat-uk.org/satellites/comms/camsat-cas-4a-cas-4b/
+#
+# Chinese 1U CubeSat from CAMSAT, sister to CAS-4A, launched 2017-06-15
+# on the SuperView-1 ride. Same payload layout as CAS-4A: a linear V/U
+# transponder plus a 4k8 GMSK telemetry beacon. CAS-4B sits 57 kHz above
+# CAS-4A on the band plan.
+
+[satellite]
+name = "CAS-4B"
+aliases = ["CAMSAT CAS-4B", "BY70-3", "ZHUHAI-1 03"]
+norad_id = 42759
+
+[[downlink]]
+label = "4k8 GMSK telemetry beacon"
+freq_hz = 145_893_000
+modulation = "GMSK"
+baudrate = 4800
+framing = "AX25"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.line_coding]
+kind = "nrzi"
+
+[downlink.descrambler]
+kind = "g3ruh"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"

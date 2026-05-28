@@ -1,0 +1,51 @@
+# CAMSAT CAS-4A satellite definition.
+#
+# Reference: https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#            https://www.amsat.org/two-way-satellites/cas-4a-and-cas-4b/
+#            https://amsat-uk.org/satellites/comms/camsat-cas-4a-cas-4b/
+#
+# Chinese 1U CubeSat from CAMSAT (Chinese Amateur Satellite Group),
+# launched 2017-06-15 as a piggyback on the SuperView-1 ride. Carries a
+# linear V/U transponder for amateur SSB/CW use plus a 4k8 GMSK
+# telemetry beacon at 145.836 MHz using AX.25 wrapped in G3RUH 9600-style
+# scrambling. The same physical layer is shared with sister satellite
+# CAS-4B (CAS-4B.toml).
+#
+# Telemetry interpretation is intentionally omitted - the on-orbit
+# beacon format is mission-specific and not yet wired up here. The
+# decode chain stops at the AX.25 codec which surfaces the decoded UI
+# frame for inspection.
+
+[satellite]
+name = "CAS-4A"
+aliases = ["CAMSAT CAS-4A", "BY70-2", "ZHUHAI-1 02"]
+norad_id = 42761
+
+[[downlink]]
+label = "4k8 GMSK telemetry beacon"
+freq_hz = 145_836_000
+modulation = "GMSK"
+baudrate = 4800
+framing = "AX25"
+
+[downlink.modem]
+kind = "cpm"
+mode = "gmsk"
+modulation_index = 0.5
+gaussian_bt = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.line_coding]
+kind = "nrzi"
+
+[downlink.descrambler]
+kind = "g3ruh"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"

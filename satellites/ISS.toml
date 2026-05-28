@@ -1,0 +1,70 @@
+# International Space Station amateur radio downlink.
+#
+# Reference: https://www.ariss.org/
+#            https://www.amsat.org/iss-frequencies/
+#            https://www.sigidwiki.com/wiki/Bell_202_(AFSK)
+#
+# The ISS amateur radio service runs an APRS digipeater on 145.825 MHz
+# worldwide using the classic Bell 202 audio FSK (1200 Hz mark, 2200 Hz
+# space, 1200 baud) over AX.25 with NRZI line coding and HDLC framing.
+# The same downlink also carries crossband repeater traffic, ARISS school
+# contact voice, and (during scheduled events) SSTV image transmissions
+# on the same frequency, but those modes are out of scope for this
+# definition - only the data digipeater is decoded here.
+#
+# Frames are standard AX.25 UI packets containing APRS payloads (position
+# reports, status messages, telemetry from the digipeater itself). No
+# scrambling is applied; the receive chain is:
+#
+#   FM audio -> AFSK 1200 (Bell 202) -> NRZI -> HDLC -> AX.25
+#
+# Telemetry interpretation is deliberately omitted: APRS payloads are
+# free-form ASCII whose structure is documented in the APRS spec, not in
+# this satellite's own format. The decode chain stops at the AX.25 codec
+# so the GUI surfaces the raw frame info field for inspection.
+
+[satellite]
+name = "ISS"
+aliases = ["International Space Station", "ZARYA", "ARISS"]
+norad_id = 25544
+
+[[downlink]]
+label = "APRS digipeater (1k2 AFSK)"
+freq_hz = 145_825_000
+modulation = "AFSK"
+baudrate = 1200
+framing = "AX25"
+
+[downlink.modem]
+kind = "afsk"
+mark_hz = 1200.0
+space_hz = 2200.0
+
+[downlink.line_coding]
+kind = "nrzi"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"
+
+# ARISS Slow-Scan TV.
+#
+# During scheduled events the ISS transmits SSTV imagery on the same
+# 145.800 MHz amateur downlink using narrow-band FM with
+# audio-frequency tone scanning. The decoder auto-detects the mode
+# from the 1900 Hz / 1200 Hz VIS preamble. Today only Robot36 (12 s,
+# 320x240) decodes to a real image; PD120 is detected but rendered as
+# a placeholder until line scanning is implemented. There is no
+# modem / framer / codec stage - the demodulated audio feeds an SSTV
+# scanner that produces RGB888 images directly.
+[[downlink]]
+label = "SSTV (Robot36)"
+freq_hz = 145_800_000
+modulation = "FM"
+baudrate = 0
+framing = "SSTV"
+
+[downlink.image]
+protocol = "sstv"

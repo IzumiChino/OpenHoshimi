@@ -74,27 +74,25 @@ payload_bits = 528
 kind = "geoscan"
 
 # Optional image-reassembly stage. Geoscan-format image frames have a
-# fixed 3-byte prefix `02 00 3E`:
+# fixed 5-byte prefix `02 00 3E 05 09`:
 #   byte 0   = satellite number (0x02 for STRATOSAT-TK-1)
 #   byte 1   = reserved (0x00)
 #   byte 2   = data field size (0x3E = 62)
-# Bytes 3..5 carry a 2-byte "message type" that varies per image
-# class (e.g. 0x05 0x09, 0x0D 0x09, ...) and so cannot be part of the
-# signature. Bytes 5..7 are the LE byte offset into the canvas, byte 7
-# is the subsystem / group id, and bytes 8..64 are the 56-byte chunk.
+#   bytes 3..5 = message type 0x05 0x09 (image-bearing class)
+# Bytes 5..7 are the LE byte offset into the JPEG bitstream, byte 7
+# is a fixed marker (always 0x06 in observed traffic) and is NOT a
+# group / image id, so the reassembler cannot use it to separate
+# images. Bytes 8..64 are the 56-byte JPEG chunk.
 #
-# Caveat: real Geoscan downlinks transmit JPEG bitstream chunks, not
-# raw pixels. Our reassembler concatenates chunks as raw bytes, so the
-# rendered canvas is a debug view, not a faithful image. JPEG decoding
-# is a future enhancement; the image tab still gives a useful "filled
-# / missing chunks" status while that work lands.
+# The downlink carries a sequence of independent JPEG images
+# concatenated together. Each new image starts with the JPEG SOI
+# marker `FF D8` at offset 0, which the reassembler watches for to
+# split the stream into per-image canvases. JPEG decoding happens at
+# render / save time.
 [downlink.image]
 protocol = "geoscan"
-header_signature = "02 00 3E"
+header_signature = "02 00 3E 05 09"
 offset_field = { at = 5, len = 2, endian = "le" }
-group_field = { at = 7, len = 1, endian = "be" }
 chunk_at = 8
 chunk_bytes = 56
-width = 1536
-height = 1024
-pixel_format = "gray8"
+decoder = "jpeg"
