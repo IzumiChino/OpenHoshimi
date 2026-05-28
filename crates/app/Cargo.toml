@@ -24,3 +24,4 @@ egui_extras = { workspace = true }
 rfd = { workspace = true }
 rustfft = { workspace = true }
 png = { workspace = true }
+jpeg-decoder = { workspace = true }

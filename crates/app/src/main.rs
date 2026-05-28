@@ -17,8 +17,9 @@ use eframe::egui::{
     ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextureOptions, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
+use openhoshimi_codec::SstvAnalyzer;
 use openhoshimi_core::satellite::{
-    load_all_satellites, DownlinkDef, ModemDef, SatelliteDefinition,
+    load_all_satellites, DownlinkDef, ImageDef, ModemDef, SatelliteDefinition,
 };
 use openhoshimi_core::{
     Frame as CoreFrame, InputSource, IoError, IqSample, IqSource, TelemetryField, TelemetryValue,
@@ -27,7 +28,7 @@ use openhoshimi_dsp::estimate_audio_carrier;
 use openhoshimi_io::{
     detect_audio_mode_auto, enumerate_input_devices, open_audio_source, read_audio_prefix,
     read_iq_prefix, AudioMode as IoAudioMode, MonoIqSource, SoundcardDeviceInfo, SoundcardIqSource,
-    SoundcardSource, WavIqSource, WavSource,
+    SoundcardSource, WavIqSource,
 };
 use openhoshimi_runtime::pipeline::{
     can_build_downlink, estimate_cpm_iq_frequency_offset_hz, estimate_iq_frequency_offset_hz,
@@ -154,12 +155,21 @@ struct OpenHoshimiApp {
     /// lazily from `image_reassembler.snapshot()` when `image_dirty` is
     /// set.
     image_texture: Option<egui::TextureHandle>,
+    /// `image_idx` whose decoded pixels currently sit in
+    /// `image_texture`. Lets us tell "old texture from a different
+    /// stream" (must be cleared) from "old texture from the same
+    /// stream" (keep across transient JPEG decode failures while
+    /// later chunks fill in).
+    image_texture_for_idx: Option<u32>,
     /// Set when a new chunk has been ingested, consumed by the image
     /// view on the next repaint to upload a fresh texture.
     image_dirty: bool,
-    /// Group id currently shown in the image view. Stays at 0 until the
-    /// user clicks a different group chip.
-    image_active_group: u32,
+    /// Image-stream index currently shown in the image view. Stays at
+    /// 0 until the user clicks a different image chip. The Geoscan
+    /// protocol does not carry an explicit image id, so the
+    /// reassembler assigns indices in arrival order; this is the same
+    /// index reported by `ImageStream::image_idx`.
+    image_active_idx: u32,
     /// Diagnostic counter for image payloads that arrived while the
     /// reassembler was active but failed the header / structural check.
     /// Reset whenever the reassembler is rebuilt.
@@ -170,6 +180,18 @@ struct OpenHoshimiApp {
     /// Set once we have logged a representative non-matching payload
     /// prefix to the diagnostic panel, so the log is not flooded.
     image_payload_logged: bool,
+    /// Latest fully-decoded SSTV image, if any. Populated from
+    /// `RxEvent::SstvImage` and rendered by the image view when the
+    /// active downlink is SSTV; the bit-pipeline reassembler is bypassed
+    /// for this path. Reset whenever the reassembler is refreshed (i.e.
+    /// the active downlink changes).
+    latest_sstv: Option<openhoshimi_codec::SstvImage>,
+    /// GPU texture for `latest_sstv`. Lazily rebuilt when
+    /// `sstv_dirty` is set.
+    sstv_texture: Option<egui::TextureHandle>,
+    /// Repaint trigger for `sstv_texture`. Mirrors `image_dirty` but
+    /// targets the SSTV pathway.
+    sstv_dirty: bool,
     /// Most recent pipeline counters published by the decode thread.
     /// `None` until the first `RxEvent::PipelineStats` arrives or after
     /// a downlink change resets the GUI side.  Surfaced in the status
@@ -224,6 +246,11 @@ enum RxEvent {
     /// the GUI side decides whether to ingest based on its own
     /// reassembler state.
     ImagePayload(Vec<u8>),
+    /// One fully decoded SSTV image. Sent by the `RuntimeInput::Sstv`
+    /// worker arm whenever `SstvAnalyzer::drain_images` produces a
+    /// frame; the GUI replaces `latest_sstv` and refreshes the image
+    /// tab.
+    SstvImage(Box<openhoshimi_codec::SstvImage>),
     /// Cumulative pipeline counters (samples in, demodulated bits, sync
     /// attempts / locks, frames emitted) sampled from `BitPipeline` after
     /// each `push_samples` call. Surfaced in the status bar so the
@@ -335,11 +362,15 @@ impl OpenHoshimiApp {
             bottom_tab: BottomTab::Frames,
             image_reassembler: None,
             image_texture: None,
+            image_texture_for_idx: None,
             image_dirty: false,
-            image_active_group: 0,
+            image_active_idx: 0,
             image_payload_misses: 0,
             image_payload_hits: 0,
             image_payload_logged: false,
+            latest_sstv: None,
+            sstv_texture: None,
+            sstv_dirty: false,
             latest_stats: None,
         };
         app.reload_satellites();
@@ -611,6 +642,21 @@ impl OpenHoshimiApp {
                 }
                 RxEvent::PipelineStats(stats) => {
                     self.latest_stats = Some(stats);
+                }
+                RxEvent::SstvImage(image) => {
+                    self.push_diagnostic(
+                        DiagnosticLevel::Info,
+                        format!(
+                            "SSTV: decoded {:?} image ({}x{})",
+                            image.mode, image.width, image.height
+                        ),
+                    );
+                    self.latest_sstv = Some(*image);
+                    self.sstv_dirty = true;
+                    self.sstv_texture = None;
+                    if matches!(self.bottom_tab, BottomTab::Frames) {
+                        self.bottom_tab = BottomTab::Image;
+                    }
                 }
             }
         }
@@ -955,13 +1001,13 @@ impl OpenHoshimiApp {
                 .width(180.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.input_mode, InputMode::Soundcard, "Soundcard");
-                    ui.selectable_value(&mut self.input_mode, InputMode::WavFile, "WAV file");
+                    ui.selectable_value(&mut self.input_mode, InputMode::WavFile, "Audio file");
                 });
             if matches!(self.input_mode, InputMode::Soundcard) {
                 self.soundcard_device_combo(ui);
             }
             if matches!(self.input_mode, InputMode::WavFile)
-                && bracket_button(ui, "Open WAV...", 180.0).clicked()
+                && bracket_button(ui, "Open audio...", 180.0).clicked()
             {
                 self.open_wav();
             }
@@ -1265,7 +1311,11 @@ impl OpenHoshimiApp {
     fn center_workspace(&mut self, ui: &mut egui::Ui) {
         self.spectrum(ui);
         self.frame_toolbar(ui);
-        if self.image_reassembler.is_some() {
+        let has_image_view = self.image_reassembler.is_some()
+            || self
+                .selected_downlink()
+                .is_some_and(|d| matches!(d.image, Some(ImageDef::Sstv {})));
+        if has_image_view {
             self.bottom_tab_bar(ui);
             match self.bottom_tab {
                 BottomTab::Frames => {
@@ -1585,50 +1635,179 @@ impl OpenHoshimiApp {
     }
 
     /// Render the image-reassembly view: canvas on top with a status
-    /// row underneath showing per-group receipt progress, plus Reset
-    /// and Save PNG controls. Cheap to call every frame; the texture
-    /// is only re-uploaded when [`Self::image_dirty`] is set or no
+    /// row underneath showing per-image receipt progress, plus Reset
+    /// and Save controls. Cheap to call every frame; the texture is
+    /// only re-uploaded when [`Self::image_dirty`] is set or no
     /// texture exists yet, so steady-state cost is one painter.image
     /// call.
     fn image_view(&mut self, ui: &mut egui::Ui) {
+        // SSTV bypasses the chunk reassembler entirely. When the active
+        // downlink decodes images via SstvAnalyzer, render the latest
+        // received frame (if any) and skip the reassembler-driven path.
+        if self
+            .selected_downlink()
+            .is_some_and(|d| matches!(d.image, Some(ImageDef::Sstv {})))
+        {
+            self.sstv_view(ui);
+            return;
+        }
         let snapshot = match self.image_reassembler.as_ref() {
             Some(r) => r.snapshot(),
             None => return,
         };
-        let group_count = snapshot.groups.len();
-        let active_group_idx = snapshot
-            .groups
+        let image_count = snapshot.images.len();
+        let active_idx = snapshot
+            .images
             .iter()
-            .position(|g| g.group_id == self.image_active_group)
+            .position(|s| s.image_idx == self.image_active_idx)
             .unwrap_or(0);
-        let active_group = snapshot.groups.get(active_group_idx);
+        let active_image = snapshot.images.get(active_idx);
+        // If the active stream changed, blow away the old texture so
+        // the placeholder shows while we wait for the next decode of
+        // the *new* stream. Otherwise keep the last-good texture in
+        // place across transient decode failures (truncated JPEG mid
+        // arrival).
+        let active_image_idx = active_image.map(|s| s.image_idx);
+        if self.image_texture_for_idx != active_image_idx {
+            self.image_texture = None;
+            self.image_texture_for_idx = None;
+        }
         let needs_upload = self.image_dirty || self.image_texture.is_none();
+        let mut canvas_dims = (snapshot.width.max(1) as f32, snapshot.height.max(1) as f32);
+        let mut render_kind: Option<ImageRenderKind> = None;
         if needs_upload {
-            if let Some(group) = active_group {
-                let color_image = render_image(&snapshot, group);
-                match self.image_texture.as_mut() {
-                    Some(tex) => tex.set(color_image, TextureOptions::NEAREST),
-                    None => {
-                        self.image_texture = Some(ui.ctx().load_texture(
-                            "image_canvas",
-                            color_image,
-                            TextureOptions::NEAREST,
-                        ));
+            if let Some(stream) = active_image {
+                if let Some((color_image, w, h, kind)) = render_image(&snapshot, stream) {
+                    canvas_dims = (w as f32, h as f32);
+                    match self.image_texture.as_mut() {
+                        Some(tex) => tex.set(color_image, TextureOptions::NEAREST),
+                        None => {
+                            self.image_texture = Some(ui.ctx().load_texture(
+                                "image_canvas",
+                                color_image,
+                                TextureOptions::NEAREST,
+                            ));
+                        }
                     }
+                    self.image_texture_for_idx = Some(stream.image_idx);
+                    render_kind = Some(kind);
                 }
-            } else {
-                self.image_texture = None;
             }
             self.image_dirty = false;
+        } else if let Some(tex) = self.image_texture.as_ref() {
+            let size = tex.size();
+            canvas_dims = (size[0] as f32, size[1] as f32);
         }
         let avail = ui.available_size();
         let canvas_h = (avail.y - 56.0).max(120.0);
-        let canvas_w = avail.x;
+        // Reserve a fixed-width strip on the right for the packet
+        // grid + progress bar. Mirrors the SSDV mockup. Falls back to
+        // canvas-only if the available width can't fit both.
+        let grid_w = if avail.x > 480.0 { 220.0 } else { 0.0 };
+        let canvas_w = (avail.x - grid_w).max(120.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui(Vec2::new(canvas_w, canvas_h), |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
+                if let Some(tex) = self.image_texture.as_ref() {
+                    let (img_w, img_h) = canvas_dims;
+                    let scale = (canvas_w / img_w).min(canvas_h / img_h);
+                    let draw = Vec2::new(img_w * scale, img_h * scale);
+                    let origin = Pos2::new(
+                        rect.center().x - draw.x * 0.5,
+                        rect.center().y - draw.y * 0.5,
+                    );
+                    let dest = Rect::from_min_size(origin, draw);
+                    ui.painter().image(
+                        tex.id(),
+                        dest,
+                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    if matches!(render_kind, Some(ImageRenderKind::JpegBytesPreview)) {
+                        ui.painter().text(
+                            Pos2::new(rect.left() + 6.0, rect.top() + 4.0),
+                            egui::Align2::LEFT_TOP,
+                            "JPEG header pending — raw chunk preview",
+                            FontId::monospace(11.0),
+                            Palette::MUTED,
+                        );
+                    }
+                } else {
+                    let msg = match active_image {
+                        None => "waiting for image chunks\u{2026}".to_string(),
+                        Some(stream) => format!(
+                            "image #{}: {}/{} chunks; decoding\u{2026}",
+                            stream.image_idx, stream.received_count, stream.total_chunks,
+                        ),
+                    };
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        msg,
+                        FontId::monospace(12.0),
+                        Palette::MUTED,
+                    );
+                }
+            });
+            if grid_w > 0.0 {
+                ui.allocate_ui(Vec2::new(grid_w, canvas_h), |ui| {
+                    self.packet_grid(ui, active_image, grid_w, canvas_h);
+                });
+            }
+        });
+        self.image_status_row(ui, &snapshot, image_count);
+    }
+
+    /// SSTV pathway counterpart to [`Self::image_view`]. Renders
+    /// `latest_sstv` directly to a canvas, with a status row underneath
+    /// describing the mode / size of the most recently decoded frame.
+    /// `latest_sstv` is reset whenever the active downlink changes
+    /// (`refresh_image_reassembler`), so the canvas naturally clears
+    /// when the user navigates away from an SSTV downlink.
+    fn sstv_view(&mut self, ui: &mut egui::Ui) {
+        // Lazily upload the texture from `latest_sstv`. We only rebuild
+        // when sstv_dirty fires, mirroring the chunk-reassembler path.
+        if self.sstv_dirty {
+            if let Some(image) = self.latest_sstv.as_ref() {
+                let w = image.width.max(1) as usize;
+                let h = image.height.max(1) as usize;
+                let expected = w.saturating_mul(h).saturating_mul(3);
+                if image.pixels.len() >= expected {
+                    let mut rgba = Vec::with_capacity(w * h * 4);
+                    for chunk in image.pixels[..expected].chunks_exact(3) {
+                        rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xff]);
+                    }
+                    let color = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                    match self.sstv_texture.as_mut() {
+                        Some(tex) => tex.set(color, TextureOptions::NEAREST),
+                        None => {
+                            self.sstv_texture = Some(ui.ctx().load_texture(
+                                "sstv_canvas",
+                                color,
+                                TextureOptions::NEAREST,
+                            ));
+                        }
+                    }
+                }
+            }
+            self.sstv_dirty = false;
+        }
+        let avail = ui.available_size();
+        let canvas_h = (avail.y - 28.0).max(120.0);
+        let canvas_w = avail.x.max(120.0);
+        let canvas_dims = self
+            .latest_sstv
+            .as_ref()
+            .map(|i| (i.width.max(1) as f32, i.height.max(1) as f32))
+            .unwrap_or((1.0, 1.0));
         let (rect, _) = ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::hover());
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
-        if let Some(tex) = self.image_texture.as_ref() {
-            let (img_w, img_h) = (snapshot.width as f32, snapshot.height as f32);
+        if let Some(tex) = self.sstv_texture.as_ref() {
+            let (img_w, img_h) = canvas_dims;
             let scale = (canvas_w / img_w).min(canvas_h / img_h);
             let draw = Vec2::new(img_w * scale, img_h * scale);
             let origin = Pos2::new(
@@ -1646,23 +1825,36 @@ impl OpenHoshimiApp {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "waiting for image chunks\u{2026}",
+                "waiting for SSTV image\u{2026}",
                 FontId::monospace(12.0),
                 Palette::MUTED,
             );
         }
-        self.image_status_row(ui, &snapshot, group_count);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.painter()
+                    .rect_filled(ui.max_rect(), CornerRadius::ZERO, Palette::PANEL);
+                ui.add_space(6.0);
+                let text = match self.latest_sstv.as_ref() {
+                    Some(i) => format!("SSTV {:?}: {}x{}", i.mode, i.width, i.height),
+                    None => "SSTV: no image decoded yet".to_string(),
+                };
+                label_muted(ui, &text);
+            },
+        );
     }
 
-    /// Status strip for the image view: shows current group, progress
-    /// (`received/total chunks`, percent complete), a group selector
-    /// chip row, and Reset / Save PNG buttons. Hidden when there are
-    /// no active groups yet.
+    /// Status strip for the image view: shows the active image's
+    /// progress (`received/total chunks`, percent complete), an
+    /// image-selector chip row, and Reset / Save buttons. Hidden when
+    /// no image chunks have arrived yet.
     fn image_status_row(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &openhoshimi_codec::ImageSnapshot,
-        group_count: usize,
+        image_count: usize,
     ) {
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 22.0),
@@ -1671,7 +1863,7 @@ impl OpenHoshimiApp {
                 ui.painter()
                     .rect_filled(ui.max_rect(), CornerRadius::ZERO, Palette::PANEL);
                 ui.add_space(6.0);
-                if group_count == 0 {
+                if image_count == 0 {
                     if self.image_payload_misses > 0 {
                         label_muted(
                             ui,
@@ -1686,40 +1878,44 @@ impl OpenHoshimiApp {
                     return;
                 }
                 let active = snapshot
-                    .groups
+                    .images
                     .iter()
-                    .find(|g| g.group_id == self.image_active_group)
-                    .or_else(|| snapshot.groups.first());
-                if let Some(group) = active {
-                    let pct = if group.total_chunks == 0 {
+                    .find(|s| s.image_idx == self.image_active_idx)
+                    .or_else(|| snapshot.images.first());
+                if let Some(stream) = active {
+                    let pct = if stream.total_chunks == 0 {
                         0.0
                     } else {
-                        100.0 * group.received_count as f32 / group.total_chunks as f32
+                        100.0 * stream.received_count as f32 / stream.total_chunks as f32
                     };
                     label_muted(
                         ui,
                         &format!(
-                            "group {}: {}/{} chunks ({:.1}%)",
-                            group.group_id, group.received_count, group.total_chunks, pct
+                            "image #{}: {}/{} chunks ({:.1}%) | {} bytes",
+                            stream.image_idx,
+                            stream.received_count,
+                            stream.total_chunks,
+                            pct,
+                            stream.bytes.len(),
                         ),
                     );
                 }
                 ui.add_space(8.0);
-                self.image_status_row_groups(ui, snapshot);
+                self.image_status_row_images(ui, snapshot);
                 self.image_status_row_buttons(ui, snapshot);
             },
         );
     }
 
-    fn image_status_row_groups(
+    fn image_status_row_images(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &openhoshimi_codec::ImageSnapshot,
     ) {
-        for group in &snapshot.groups {
-            let active = group.group_id == self.image_active_group;
-            if tab_button(ui, &format!("g{}", group.group_id), active).clicked() && !active {
-                self.image_active_group = group.group_id;
+        for stream in &snapshot.images {
+            let active = stream.image_idx == self.image_active_idx;
+            if tab_button(ui, &format!("#{}", stream.image_idx), active).clicked() && !active {
+                self.image_active_idx = stream.image_idx;
                 self.image_dirty = true;
             }
             ui.add_space(2.0);
@@ -1737,30 +1933,70 @@ impl OpenHoshimiApp {
                 r.reset();
             }
             self.image_texture = None;
-            self.image_active_group = 0;
+            self.image_texture_for_idx = None;
+            self.image_active_idx = 0;
             self.image_dirty = true;
         }
-        if bracket_button(ui, "Save PNG", 80.0).clicked() {
-            if let Err(err) = self.save_image_png(snapshot) {
-                self.push_diagnostic(DiagnosticLevel::Error, format!("save PNG failed: {err}"));
+        let save_label = match snapshot.decoder {
+            openhoshimi_codec::ImageDecoder::Jpeg => "Save JPEG",
+            openhoshimi_codec::ImageDecoder::Raw => "Save PNG",
+        };
+        if bracket_button(ui, save_label, 84.0).clicked() {
+            if let Err(err) = self.save_image(snapshot) {
+                self.push_diagnostic(DiagnosticLevel::Error, format!("save image failed: {err}"));
             }
         }
     }
 
-    /// Encode the active group's reassembled buffer as a PNG and write
-    /// it to a user-selected file. Returns `Err` only on encoder/IO
-    /// failure; the user simply cancelling the dialog is reported as
-    /// `Ok(())` so the caller does not surface a spurious error.
-    fn save_image_png(&self, snapshot: &openhoshimi_codec::ImageSnapshot) -> Result<(), String> {
-        let group = snapshot
-            .groups
+    /// Save the active image to disk. JPEG-decoder streams are written
+    /// verbatim with a `.jpg` extension because the satellite already
+    /// emits a complete JPEG bitstream; raw streams are encoded as PNG
+    /// using the snapshot's pixel format. Returns `Err` only on
+    /// encoder/IO failure; the user simply cancelling the dialog is
+    /// reported as `Ok(())`.
+    fn save_image(&self, snapshot: &openhoshimi_codec::ImageSnapshot) -> Result<(), String> {
+        let stream = snapshot
+            .images
             .iter()
-            .find(|g| g.group_id == self.image_active_group)
-            .or_else(|| snapshot.groups.first())
-            .ok_or_else(|| "no image group available".to_string())?;
+            .find(|s| s.image_idx == self.image_active_idx)
+            .or_else(|| snapshot.images.first())
+            .ok_or_else(|| "no image stream available".to_string())?;
+        match snapshot.decoder {
+            openhoshimi_codec::ImageDecoder::Jpeg => self.save_image_jpeg(snapshot, stream),
+            openhoshimi_codec::ImageDecoder::Raw => self.save_image_png(snapshot, stream),
+        }
+    }
+
+    fn save_image_jpeg(
+        &self,
+        snapshot: &openhoshimi_codec::ImageSnapshot,
+        stream: &openhoshimi_codec::ImageStream,
+    ) -> Result<(), String> {
+        let bytes = jpeg_export_bytes(snapshot, stream);
         let default_name = format!(
-            "openhoshimi_image_g{}_{}x{}.png",
-            group.group_id, snapshot.width, snapshot.height
+            "openhoshimi_image_{}_{}b.jpg",
+            stream.image_idx,
+            bytes.len()
+        );
+        let Some(path) = FileDialog::new()
+            .set_file_name(default_name)
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .save_file()
+        else {
+            return Ok(());
+        };
+        std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+        Ok(())
+    }
+
+    fn save_image_png(
+        &self,
+        snapshot: &openhoshimi_codec::ImageSnapshot,
+        stream: &openhoshimi_codec::ImageStream,
+    ) -> Result<(), String> {
+        let default_name = format!(
+            "openhoshimi_image_{}_{}x{}.png",
+            stream.image_idx, snapshot.width, snapshot.height
         );
         let Some(path) = FileDialog::new()
             .set_file_name(default_name)
@@ -1786,11 +2022,131 @@ impl OpenHoshimiApp {
         let mut writer = encoder
             .write_header()
             .map_err(|e| format!("png header: {e}"))?;
-        let pixels = encode_pixels_for_png(snapshot, group);
+        let pixels = encode_pixels_for_png(snapshot, stream);
         writer
             .write_image_data(&pixels)
             .map_err(|e| format!("png write: {e}"))?;
         Ok(())
+    }
+
+    /// SSDV-style packet grid. Renders one small square per chunk slot
+    /// (received = green, missing = panel-grey, latest = blue), with a
+    /// progress bar above and a `received/total (pct%)` label below.
+    /// Square edge auto-fits the available column width; the layout
+    /// degrades gracefully for very high chunk counts (~thousands) by
+    /// shrinking the cell down to 2 px.
+    fn packet_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        active_image: Option<&openhoshimi_codec::ImageStream>,
+        grid_w: f32,
+        canvas_h: f32,
+    ) {
+        let (panel_rect, _) = ui.allocate_exact_size(Vec2::new(grid_w, canvas_h), Sense::hover());
+        let painter = ui.painter_at(panel_rect);
+        painter.rect_filled(panel_rect, CornerRadius::ZERO, Palette::PANEL);
+        let Some(stream) = active_image else {
+            painter.text(
+                panel_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "no chunks",
+                FontId::monospace(11.0),
+                Palette::MUTED,
+            );
+            return;
+        };
+        let total = stream.total_chunks;
+        if total == 0 {
+            painter.text(
+                panel_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "0 chunks",
+                FontId::monospace(11.0),
+                Palette::MUTED,
+            );
+            return;
+        }
+        let pad_x = 8.0;
+        let pad_y = 6.0;
+        let inner_w = (panel_rect.width() - pad_x * 2.0).max(1.0);
+        let header_h = 14.0;
+        let bar_h = 6.0;
+        let footer_h = 14.0;
+        let header_top = panel_rect.top() + pad_y;
+        let bar_top = header_top + header_h + 2.0;
+        let grid_top = bar_top + bar_h + 6.0;
+        let footer_top = panel_rect.bottom() - pad_y - footer_h;
+        let grid_bottom = footer_top - 4.0;
+        let grid_h = (grid_bottom - grid_top).max(0.0);
+        let pct = 100.0 * stream.received_count as f32 / total as f32;
+        painter.text(
+            Pos2::new(panel_rect.left() + pad_x, header_top),
+            egui::Align2::LEFT_TOP,
+            format!("packets  {}/{}", stream.received_count, total),
+            FontId::monospace(11.0),
+            Palette::TEXT,
+        );
+        let bar_rect = Rect::from_min_size(
+            Pos2::new(panel_rect.left() + pad_x, bar_top),
+            Vec2::new(inner_w, bar_h),
+        );
+        painter.rect_filled(bar_rect, CornerRadius::ZERO, Palette::BG);
+        let fill_w = inner_w * (stream.received_count as f32 / total as f32).clamp(0.0, 1.0);
+        if fill_w > 0.0 {
+            painter.rect_filled(
+                Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, bar_h)),
+                CornerRadius::ZERO,
+                Palette::GREEN,
+            );
+        }
+        let target_cell = 14.0_f32;
+        let min_cell = 2.0_f32;
+        let total_f = total as f32;
+        let mut cell = target_cell;
+        let mut cols = (inner_w / (cell + 1.0)).floor().max(1.0) as u32;
+        loop {
+            let rows = total_f / cols as f32;
+            let needed_h = rows.ceil() * (cell + 1.0);
+            if needed_h <= grid_h || cell <= min_cell {
+                break;
+            }
+            cell = (cell - 1.0).max(min_cell);
+            cols = (inner_w / (cell + 1.0)).floor().max(1.0) as u32;
+        }
+        let gap = if cell >= 6.0 { 1.0 } else { 0.0 };
+        let step = cell + gap;
+        let cols = ((inner_w + gap) / step).floor().max(1.0) as u32;
+        let last_idx = stream.last_chunk_idx;
+        for idx in 0..total {
+            let row = idx / cols;
+            let col = idx % cols;
+            let x = panel_rect.left() + pad_x + col as f32 * step;
+            let y = grid_top + row as f32 * step;
+            if y + cell > grid_bottom {
+                break;
+            }
+            let received = stream.chunk_received(idx);
+            let mut color = if received {
+                Palette::GREEN
+            } else {
+                Color32::from_rgb(56, 58, 62)
+            };
+            if stream.received_count > 0 && idx == last_idx {
+                color = Palette::BLUE;
+            }
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell, cell)),
+                CornerRadius::ZERO,
+                color,
+            );
+        }
+        painter.text(
+            Pos2::new(panel_rect.left() + pad_x, footer_top),
+            egui::Align2::LEFT_TOP,
+            format!("{:.1}%  last #{}", pct, last_idx),
+            FontId::monospace(11.0),
+            Palette::MUTED,
+        );
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
@@ -1876,7 +2232,7 @@ impl OpenHoshimiApp {
                                 &format!("{} {}bd", downlink.modulation, downlink.baudrate),
                             );
                             key_value(ui, "framing", &downlink.framing);
-                            key_value(ui, "input", input_kind_label(input_kind_for(downlink)));
+                            key_value(ui, "input", downlink_input_kind_label(downlink));
                         }
                     });
             });
@@ -1917,8 +2273,8 @@ impl OpenHoshimiApp {
 
     fn open_wav(&mut self) {
         let dialog = FileDialog::new()
-            .set_title("Open WAV input")
-            .add_filter("WAV audio", &["wav"]);
+            .set_title("Open audio input")
+            .add_filter("Audio file", &["wav", "ogg"]);
         let Some(path) = dialog.pick_file() else {
             return;
         };
@@ -1929,13 +2285,13 @@ impl OpenHoshimiApp {
         self.stop();
         self.input_path = Some(path.clone());
         self.input_mode = InputMode::WavFile;
-        self.source_description = format!("WAV file {}", short_path_label(&path));
+        self.source_description = format!("audio file {}", short_path_label(&path));
         self.clear_frames();
         self.waterfall.clear();
         self.samples_processed = 0;
         self.input_progress_processed = 0;
         self.input_progress_total = None;
-        self.status = format!("selected WAV input {}", short_path_label(&path));
+        self.status = format!("selected audio input {}", short_path_label(&path));
         self.spawn_alignment();
     }
 
@@ -1985,7 +2341,7 @@ impl OpenHoshimiApp {
     fn input_source_label(&self) -> &'static str {
         match self.input_mode {
             InputMode::Soundcard => "soundcard",
-            InputMode::WavFile => "wav file",
+            InputMode::WavFile => "audio file",
         }
     }
 
@@ -2119,13 +2475,24 @@ impl OpenHoshimiApp {
     fn refresh_image_reassembler(&mut self) {
         self.image_reassembler = None;
         self.image_texture = None;
+        self.image_texture_for_idx = None;
         self.image_dirty = false;
-        self.image_active_group = 0;
+        self.image_active_idx = 0;
         self.image_payload_misses = 0;
         self.image_payload_hits = 0;
         self.image_payload_logged = false;
+        self.latest_sstv = None;
+        self.sstv_texture = None;
+        self.sstv_dirty = false;
         let image_def = self.selected_downlink().and_then(|d| d.image.clone());
         if let Some(def) = image_def {
+            // SSTV is decoded by the runtime worker via SstvAnalyzer
+            // and reaches the image tab through `latest_sstv`, not via
+            // the chunk reassembler. Skip the build instead of letting
+            // it surface a misleading init error.
+            if matches!(def, ImageDef::Sstv {}) {
+                return;
+            }
             match openhoshimi_codec::build_image_reassembler(&def) {
                 Ok(r) => self.image_reassembler = Some(r),
                 Err(err) => self.push_diagnostic(
@@ -2166,7 +2533,7 @@ impl OpenHoshimiApp {
                     downlink.modulation,
                     downlink.baudrate,
                     downlink.framing,
-                    input_kind_label(input_kind_for(downlink))
+                    downlink_input_kind_label(downlink)
                 )
             })
             .unwrap_or_else(|| "no downlink selected".to_string())
@@ -2476,6 +2843,46 @@ fn run_decode_thread(
                     break;
                 }
             }
+            RuntimeInput::Sstv {
+                source,
+                analyzer,
+                processed_samples,
+            } => {
+                let mut samples = [0.0f32; READ_CHUNK];
+                let read = match source.read_samples(&mut samples) {
+                    Ok(read) => read,
+                    Err(IoError::EndOfStream) => {
+                        for image in analyzer.finish() {
+                            let _ = events.send(RxEvent::SstvImage(Box::new(image)));
+                        }
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = events.send(RxEvent::Dropped(format!("audio read failed: {err}")));
+                        break;
+                    }
+                };
+                if read == 0 {
+                    continue;
+                }
+                try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                    SpectrumSamples::Audio(samples[..read.min(SPECTRUM_FFT_LEN)].to_vec())
+                });
+                analyzer.push_samples(&samples[..read]);
+                for image in analyzer.drain_images() {
+                    let _ = events.send(RxEvent::SstvImage(Box::new(image)));
+                }
+                *processed_samples = processed_samples.saturating_add(read as u64);
+                let _ = events.send(RxEvent::Progress {
+                    processed: *processed_samples,
+                    total: total_samples,
+                });
+                if pace_realtime
+                    && !pace_realtime_loop(start, sample_rate, *processed_samples, &stop)
+                {
+                    break;
+                }
+            }
         }
     }
 
@@ -2526,6 +2933,16 @@ enum RuntimeInput {
         pipeline: Box<SoftAo40Pipeline>,
         pending: Vec<IqSample>,
     },
+    /// Slow-Scan Television: raw mono audio drives an [`SstvAnalyzer`]
+    /// directly, bypassing the bit pipeline entirely. Decoded frames
+    /// are images, not bits, so they reach the GUI through a dedicated
+    /// `RxEvent::SstvImage` channel rather than `RxEvent::Frame` /
+    /// `RxEvent::ImagePayload`.
+    Sstv {
+        source: Box<dyn InputSource>,
+        analyzer: SstvAnalyzer,
+        processed_samples: u64,
+    },
 }
 
 impl RuntimeInput {
@@ -2534,6 +2951,7 @@ impl RuntimeInput {
             Self::Audio { source, .. } => source.description(),
             Self::Iq { source, .. } => source.description(),
             Self::IqSoftAo40 { source, .. } => source.description(),
+            Self::Sstv { source, .. } => source.description(),
         }
     }
 
@@ -2542,6 +2960,7 @@ impl RuntimeInput {
             Self::Audio { source, .. } => source.sample_rate(),
             Self::Iq { source, .. } => source.sample_rate(),
             Self::IqSoftAo40 { source, .. } => source.sample_rate(),
+            Self::Sstv { source, .. } => source.sample_rate(),
         }
     }
 
@@ -2550,6 +2969,7 @@ impl RuntimeInput {
             Self::Audio { source, .. } => source.total_samples(),
             Self::Iq { source, .. } => source.total_samples(),
             Self::IqSoftAo40 { source, .. } => source.total_samples(),
+            Self::Sstv { source, .. } => source.total_samples(),
         }
     }
 }
@@ -2566,6 +2986,9 @@ fn build_runtime_input(
     audio_carrier_hz: f32,
     events: &SyncSender<RxEvent>,
 ) -> Result<RuntimeInput, String> {
+    if matches!(downlink.image, Some(ImageDef::Sstv {})) {
+        return build_sstv_runtime_input(input_mode, input_path, soundcard_device);
+    }
     match input_mode {
         InputMode::Soundcard => match input_kind_for(downlink) {
             Some(InputKind::Iq) => {
@@ -2616,14 +3039,11 @@ fn build_runtime_input(
             };
             match input_kind_for(downlink) {
                 Some(InputKind::Audio) => {
-                    let source = WavSource::open(&path)
-                        .map_err(|err| format!("failed to open WAV input: {err}"))?;
+                    let source = open_audio_source(&path)?;
+                    let sample_rate = source.sample_rate();
                     let mut pipeline = BitPipeline::<f32>::new(downlink)?;
-                    pipeline.configure_demodulator(downlink, source.sample_rate(), 0.0)?;
-                    Ok(RuntimeInput::Audio {
-                        source: Box::new(source),
-                        pipeline,
-                    })
+                    pipeline.configure_demodulator(downlink, sample_rate, 0.0)?;
+                    Ok(RuntimeInput::Audio { source, pipeline })
                 }
                 Some(InputKind::Iq) => {
                     let resolved = match audio_mode {
@@ -2801,6 +3221,39 @@ fn build_runtime_input(
     }
 }
 
+fn build_sstv_runtime_input(
+    input_mode: InputMode,
+    input_path: Option<PathBuf>,
+    soundcard_device: Option<String>,
+) -> Result<RuntimeInput, String> {
+    let source: Box<dyn InputSource> = match input_mode {
+        InputMode::Soundcard => match soundcard_device.as_deref() {
+            Some(name) => Box::new(
+                SoundcardSource::open_by_name(name)
+                    .map_err(|err| format!("soundcard open failed: {err}"))?,
+            ),
+            None => Box::new(
+                SoundcardSource::open_default()
+                    .map_err(|err| format!("soundcard open failed: {err}"))?,
+            ),
+        },
+        InputMode::WavFile => {
+            let Some(path) = input_path else {
+                return Err("missing audio input path".to_string());
+            };
+            open_audio_source(&path)?
+        }
+    };
+    let sample_rate = source.sample_rate();
+    let analyzer = SstvAnalyzer::new(sample_rate)
+        .map_err(|err| format!("SSTV analyzer init failed: {err}"))?;
+    Ok(RuntimeInput::Sstv {
+        source,
+        analyzer,
+        processed_samples: 0,
+    })
+}
+
 fn run_alignment_thread(
     path: PathBuf,
     downlink: DownlinkDef,
@@ -2959,10 +3412,24 @@ fn emit_frames<P>(
         // those through corrupts the canvas. CRC mismatch on a real
         // image chunk also indicates at least one bit error in the
         // 56-byte payload, which is far worse than a missing chunk.
-        if let Ok(DecodedFrame::Geoscan(ref geoscan)) = pipeline.decode_frame(&frame) {
-            pipeline.record_crc(geoscan.crc_ok);
-            if geoscan.crc_ok {
-                let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+        if let Ok(decoded) = pipeline.decode_frame(&frame) {
+            match &decoded {
+                DecodedFrame::Geoscan(geoscan) => {
+                    pipeline.record_crc(geoscan.crc_ok);
+                    if geoscan.crc_ok {
+                        let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+                    }
+                }
+                DecodedFrame::Ssdv(packet) => {
+                    pipeline.record_crc(packet.crc_ok);
+                    if packet.crc_ok {
+                        // The SSDV image reassembler re-parses the
+                        // header, so it needs the *full* corrected
+                        // 256-byte packet rather than just payload.
+                        let _ = events.send(RxEvent::ImagePayload(packet.raw.clone()));
+                    }
+                }
+                _ => {}
             }
         }
         let row = frame_row(*count, start.elapsed(), pipeline, &frame, telemetry);
@@ -2997,6 +3464,12 @@ fn emit_decoded_frames(
         // check is the real filter.
         if let DecodedFrame::Geoscan(ref geoscan) = decoded {
             let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+        }
+        if let DecodedFrame::Ssdv(ref packet) = decoded {
+            // SsdvImageReassembler reads the full corrected wire
+            // bytes (sync, header, payload, CRC, parity), so forward
+            // the entire packet rather than just `payload`.
+            let _ = events.send(RxEvent::ImagePayload(packet.raw.clone()));
         }
         let row = decoded_frame_row(*count, start.elapsed(), satellite, decoded, telemetry);
         let _ = events.send(RxEvent::Frame(row));
@@ -3068,6 +3541,22 @@ fn decoded_frame_row(
             }
             raw = geoscan.payload;
         }
+        DecodedFrame::Ssdv(packet) => {
+            source = if packet.callsign.is_empty() {
+                "SSDV".to_string()
+            } else {
+                packet.callsign.clone()
+            };
+            destination = format!("IMG#{:03}/PKT#{:05}", packet.image_id, packet.packet_id);
+            kind = if packet.crc_ok {
+                FrameKind::Tlm
+            } else {
+                FrameKind::Err
+            };
+            // SSDV packets carry JPEG MCU bytes — they are not
+            // telemetry fields, so do not run the schema parser.
+            raw = packet.payload;
+        }
         DecodedFrame::Raw { raw_len, .. } => {
             raw = vec![0u8; raw_len];
         }
@@ -3137,6 +3626,20 @@ where
             if let Some(parser) = telemetry {
                 fields = parser.parse_bytes(&geoscan.payload);
             }
+        }
+        DecodedFrame::Ssdv(packet) => {
+            source = if packet.callsign.is_empty() {
+                "SSDV".to_string()
+            } else {
+                packet.callsign.clone()
+            };
+            destination = format!("IMG#{:03}/PKT#{:05}", packet.image_id, packet.packet_id);
+            kind = if packet.crc_ok {
+                FrameKind::Tlm
+            } else {
+                FrameKind::Err
+            };
+            // Image MCUs aren't telemetry — leave fields empty.
         }
         DecodedFrame::Raw { .. } => {
             if let Some(parser) = telemetry {
@@ -3636,20 +4139,226 @@ fn waterfall_image(waterfall: &VecDeque<Vec<f32>>, min_db: f32, max_db: f32) -> 
     image
 }
 
-/// Render an `ImageSnapshot` group's byte buffer into a `ColorImage`
-/// suitable for upload. Pixel format dispatch lives here so the GUI
-/// stays decoupled from the codec's internal byte layout.
+/// Render an `ImageSnapshot` stream's byte buffer into a `ColorImage`
+/// suitable for upload, returning the canvas dimensions actually
+/// produced. Pixel-format dispatch lives here so the GUI stays
+/// decoupled from the codec's internal byte layout.
 ///
+/// JPEG streams are decoded with `jpeg-decoder` to whatever resolution
+/// the JPEG header declares. Partial / truncated streams are normal
+/// during a pass; when the decoder rejects the bitstream we return
+/// `None` and the caller paints a "waiting for image chunks" placeholder
+/// in place of the texture.
+///
+/// Outcome flag attached to every successful `render_image` result so
+/// the GUI can label whether the user is looking at a real JPEG decode
+/// or the raw-chunk grayscale fallback that lights up before enough
+/// header bytes are in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageRenderKind {
+    /// Real JPEG decode succeeded (clean, +EOI, or truncate+EOI).
+    JpegDecoded,
+    /// JPEG decode rejected the bytestream; the preview is the raw
+    /// reassembled chunks rendered as grayscale scanlines so missing
+    /// chunks show as checker holes and the user can see what is
+    /// already on the wire even when the decoder can't make sense of
+    /// it yet.
+    JpegBytesPreview,
+    /// Decoder mode is `Raw` — pixels mapped straight from
+    /// `stream.bytes` per the snapshot's pixel format.
+    Raw,
+}
+
 /// For `Rgb565` we read big-endian as defined by Geoscan; for `Gray8`
-/// each byte becomes (B, G, R) = (v, v, v).
+/// each byte becomes (R, G, B) = (v, v, v).
 fn render_image(
     snapshot: &openhoshimi_codec::ImageSnapshot,
-    group: &openhoshimi_codec::ImageGroup,
+    stream: &openhoshimi_codec::ImageStream,
+) -> Option<(ColorImage, u32, u32, ImageRenderKind)> {
+    match snapshot.decoder {
+        openhoshimi_codec::ImageDecoder::Jpeg => render_image_jpeg(snapshot, stream),
+        openhoshimi_codec::ImageDecoder::Raw => Some((
+            render_image_raw(snapshot, stream),
+            snapshot.width,
+            snapshot.height,
+            ImageRenderKind::Raw,
+        )),
+    }
+}
+
+/// Decode a JPEG bitstream into a [`ColorImage`], tolerating partial
+/// streams. Tries four strategies in order:
+///
+/// 1. Decode the bytes verbatim. Works once a full JPEG with EOI is in.
+/// 2. Append `FF D9` (EOI) and decode. Lets jpeg-decoder render every
+///    intact MCU before giving up at the truncation point.
+/// 3. Truncate to the first missing-chunk boundary, append `FF D9`, and
+///    decode. Strategy 2 can fail when a chunk-sized hole sits inside
+///    the bytestream; cutting at the first hole lets the leading run
+///    still preview, with everything past the cut shown as black.
+/// 4. Fallback: render the raw reassembled chunks as a grayscale
+///    scanline image (one row per chunk, `chunk_bytes` columns wide).
+///    Used when the decoder rejects every truncation — typically while
+///    the JPEG header (SOI/SOF/SOS) is still missing chunks. Missing
+///    chunks show as a checkerboard so the user sees the receive
+///    pattern instead of a blank canvas.
+fn render_image_jpeg(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    stream: &openhoshimi_codec::ImageStream,
+) -> Option<(ColorImage, u32, u32, ImageRenderKind)> {
+    let bytes = &stream.bytes;
+    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return Some(render_jpeg_bytes_as_grayscale(snapshot, stream));
+    }
+    if let Some((img, w, h)) = decode_jpeg_bytes(bytes) {
+        return Some((img, w, h, ImageRenderKind::JpegDecoded));
+    }
+    let mut padded = Vec::with_capacity(bytes.len() + 2);
+    padded.extend_from_slice(bytes);
+    padded.extend_from_slice(&[0xFF, 0xD9]);
+    if let Some((img, w, h)) = decode_jpeg_bytes(&padded) {
+        return Some((img, w, h, ImageRenderKind::JpegDecoded));
+    }
+    let cut = first_missing_chunk_byte(snapshot, stream);
+    if cut > 2 {
+        let mut clipped = Vec::with_capacity(cut + 2);
+        clipped.extend_from_slice(&bytes[..cut]);
+        clipped.extend_from_slice(&[0xFF, 0xD9]);
+        if let Some((img, w, h)) = decode_jpeg_bytes(&clipped) {
+            return Some((img, w, h, ImageRenderKind::JpegDecoded));
+        }
+    }
+    Some(render_jpeg_bytes_as_grayscale(snapshot, stream))
+}
+
+/// Visualise the reassembled chunks as a grayscale scanline image:
+/// width = `chunk_bytes`, height = `total_chunks`. Received chunks
+/// paint their bytes as Y=R=G=B; missing chunks paint a checkerboard so
+/// the user can read the receive pattern at a glance even when no JPEG
+/// decode is possible. Always returns at least a 1x1 image.
+fn render_jpeg_bytes_as_grayscale(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    stream: &openhoshimi_codec::ImageStream,
+) -> (ColorImage, u32, u32, ImageRenderKind) {
+    let chunk = snapshot.chunk_bytes.max(1) as usize;
+    let total = stream.total_chunks.max(1) as usize;
+    let w = chunk;
+    let h = total;
+    let mut image = ColorImage::new([w, h], Color32::BLACK);
+    for row in 0..total {
+        let received = stream.chunk_received(row as u32);
+        for col in 0..chunk {
+            let color = if received {
+                let i = row * chunk + col;
+                let v = stream.bytes.get(i).copied().unwrap_or(0);
+                Color32::from_rgb(v, v, v)
+            } else {
+                let cell = ((col / 4) ^ (row / 4)) & 1;
+                if cell == 0 {
+                    Color32::from_rgb(36, 38, 42)
+                } else {
+                    Color32::from_rgb(60, 62, 68)
+                }
+            };
+            image[(col, row)] = color;
+        }
+    }
+    (image, w as u32, h as u32, ImageRenderKind::JpegBytesPreview)
+}
+
+/// Byte offset of the first chunk slot that has never been received.
+/// Returns `stream.bytes.len()` when every chunk covered by the buffer
+/// is filled, so the caller can use the result as an upper bound for a
+/// "decode the leading intact run" slice.
+fn first_missing_chunk_byte(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    stream: &openhoshimi_codec::ImageStream,
+) -> usize {
+    let chunk = snapshot.chunk_bytes.max(1) as usize;
+    for idx in 0..stream.total_chunks {
+        if !stream.chunk_received(idx) {
+            return (idx as usize) * chunk;
+        }
+    }
+    stream.bytes.len()
+}
+
+fn decode_jpeg_bytes(bytes: &[u8]) -> Option<(ColorImage, u32, u32)> {
+    let mut decoder = jpeg_decoder::Decoder::new(bytes);
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let w = info.width as usize;
+    let h = info.height as usize;
+    let mut image = ColorImage::new([w, h], Color32::BLACK);
+    match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let v = *pixels.get(y * w + x).unwrap_or(&0);
+                    image[(x, y)] = Color32::from_rgb(v, v, v);
+                }
+            }
+        }
+        jpeg_decoder::PixelFormat::RGB24 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 3;
+                    if let (Some(&r), Some(&g), Some(&b)) =
+                        (pixels.get(i), pixels.get(i + 1), pixels.get(i + 2))
+                    {
+                        image[(x, y)] = Color32::from_rgb(r, g, b);
+                    }
+                }
+            }
+        }
+        // CMYK32 / L16 from JPEG aren't produced by Geoscan and are
+        // rare elsewhere; treat them as unsupported and let the caller
+        // show a placeholder.
+        _ => return None,
+    }
+    Some((image, info.width as u32, info.height as u32))
+}
+
+/// Pick the best openable byte sequence for a JPEG export. Tries
+/// (1) verbatim, (2) verbatim + EOI, (3) leading-intact-run + EOI,
+/// returning the first variant that round-trips through
+/// `decode_jpeg_bytes`. When none decode, falls back to verbatim + EOI
+/// (which at least has a terminator most viewers expect) so the saved
+/// file is no worse than the raw bytes ever were.
+fn jpeg_export_bytes(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    stream: &openhoshimi_codec::ImageStream,
+) -> Vec<u8> {
+    let bytes = &stream.bytes;
+    if decode_jpeg_bytes(bytes).is_some() {
+        return bytes.clone();
+    }
+    let mut padded = Vec::with_capacity(bytes.len() + 2);
+    padded.extend_from_slice(bytes);
+    padded.extend_from_slice(&[0xFF, 0xD9]);
+    if decode_jpeg_bytes(&padded).is_some() {
+        return padded;
+    }
+    let cut = first_missing_chunk_byte(snapshot, stream);
+    if cut > 2 {
+        let mut clipped = Vec::with_capacity(cut + 2);
+        clipped.extend_from_slice(&bytes[..cut]);
+        clipped.extend_from_slice(&[0xFF, 0xD9]);
+        if decode_jpeg_bytes(&clipped).is_some() {
+            return clipped;
+        }
+    }
+    padded
+}
+
+fn render_image_raw(
+    snapshot: &openhoshimi_codec::ImageSnapshot,
+    stream: &openhoshimi_codec::ImageStream,
 ) -> ColorImage {
     let w = snapshot.width as usize;
     let h = snapshot.height as usize;
     let mut image = ColorImage::new([w, h], Color32::BLACK);
-    let bytes = &group.bytes;
+    let bytes = &stream.bytes;
     match snapshot.pixel_format {
         openhoshimi_codec::PixelFormat::Gray8 => {
             for y in 0..h {
@@ -3692,18 +4401,18 @@ fn render_image(
     image
 }
 
-/// Build a PNG-ready byte buffer for `group` using `snapshot`'s
+/// Build a PNG-ready byte buffer for `stream` using `snapshot`'s
 /// pixel format. Output layout matches the encoder header set by
 /// `save_image_png`: Gray8 → one byte per pixel, Rgb565/Rgb888 → 3
 /// bytes per pixel (R, G, B). Rgb565 is expanded to 8-bit by bit
 /// replication so the on-disk PNG looks identical to the canvas.
 fn encode_pixels_for_png(
     snapshot: &openhoshimi_codec::ImageSnapshot,
-    group: &openhoshimi_codec::ImageGroup,
+    stream: &openhoshimi_codec::ImageStream,
 ) -> Vec<u8> {
     let w = snapshot.width as usize;
     let h = snapshot.height as usize;
-    let bytes = &group.bytes;
+    let bytes = &stream.bytes;
     match snapshot.pixel_format {
         openhoshimi_codec::PixelFormat::Gray8 => {
             let mut out = vec![0u8; w * h];
@@ -3775,7 +4484,14 @@ fn downlink_combo_label(downlink: &DownlinkDef) -> String {
 }
 
 fn downlink_is_supported(downlink: &DownlinkDef) -> bool {
+    if is_sstv_downlink(downlink) {
+        return true;
+    }
     input_kind_for(downlink).is_some() && can_build_downlink(downlink)
+}
+
+fn is_sstv_downlink(downlink: &DownlinkDef) -> bool {
+    matches!(downlink.image, Some(ImageDef::Sstv {}))
 }
 
 fn input_kind_label(kind: Option<InputKind>) -> &'static str {
@@ -3784,6 +4500,14 @@ fn input_kind_label(kind: Option<InputKind>) -> &'static str {
         Some(InputKind::Iq) => "IQ",
         Some(InputKind::FmAudio) => "FM audio",
         None => "unsupported",
+    }
+}
+
+fn downlink_input_kind_label(downlink: &DownlinkDef) -> &'static str {
+    if is_sstv_downlink(downlink) {
+        "audio (SSTV)"
+    } else {
+        input_kind_label(input_kind_for(downlink))
     }
 }
 

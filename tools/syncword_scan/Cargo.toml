@@ -1,0 +1,19 @@
+[package]
+name = "syncword_scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Scan a demodulated bit stream for an attached sync marker (ASM) at every bit offset."
+
+[[bin]]
+name = "syncword_scan"
+path = "src/main.rs"
+
+[dependencies]
+openhoshimi-core = { workspace = true }
+openhoshimi-io = { workspace = true }
+openhoshimi-dsp = { workspace = true }
+clap = { workspace = true }

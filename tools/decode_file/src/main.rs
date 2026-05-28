@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use openhoshimi_codec::{Ax100Mode, Ax25Frame, GeoscanFrame};
+use openhoshimi_codec::{
+    build_image_reassembler, Ax100Mode, Ax25Frame, GeoscanFrame, ImageDecoder, ImageReassembler,
+};
 use openhoshimi_core::satellite::load_satellite;
 use openhoshimi_core::satellite::ModemDef;
 use openhoshimi_core::{Frame, InputSource, IoError, IqSample, IqSource};
@@ -40,6 +42,13 @@ struct Args {
     /// Ignored in any other mode.
     #[arg(long)]
     audio_carrier_hz: Option<f32>,
+    /// If set, run every decoded payload through the satellite's
+    /// image reassembler (when one is configured in the TOML) and
+    /// write each completed image to `<DIR>/openhoshimi_image_NN.{jpg,bin}`
+    /// when decoding finishes. Useful for offline regression-testing
+    /// the image pipeline without launching the GUI.
+    #[arg(long)]
+    dump_images: Option<PathBuf>,
 }
 
 /// How the input file should be interpreted.
@@ -80,6 +89,27 @@ fn run() -> Result<(), String> {
         .as_ref()
         .and_then(|name| satellite.telemetry.get(name))
         .map(SchemaParser::new);
+    let mut image_reassembler: Option<Box<dyn ImageReassembler>> = if args.dump_images.is_some() {
+        match selected.downlink.image.as_ref() {
+            Some(def) => match build_image_reassembler(def) {
+                Ok(r) => Some(r),
+                Err(err) => {
+                    eprintln!(
+                        "decode_file: --dump-images requested but image config is invalid: {err}"
+                    );
+                    None
+                }
+            },
+            None => {
+                eprintln!(
+                        "decode_file: --dump-images requested but the active downlink has no [downlink.image] block"
+                    );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let tuning_offset_hz =
         infer_tuning_offset_hz(&args.input_wav, selected.downlink.freq_hz).unwrap_or(0) as f32;
@@ -204,7 +234,14 @@ fn run() -> Result<(), String> {
             let timestamp = runner.timestamp();
             match entry {
                 BatchEntry::Decoded { decoded, raw } => {
-                    print_decoded_frame(frame_count, timestamp, decoded, &raw, telemetry.as_ref());
+                    print_decoded_frame(
+                        frame_count,
+                        timestamp,
+                        decoded,
+                        &raw,
+                        telemetry.as_ref(),
+                        &mut image_reassembler,
+                    );
                 }
                 BatchEntry::Pending(mut frame) => {
                     frame.satellite_id = satellite.satellite.norad_id;
@@ -215,10 +252,24 @@ fn run() -> Result<(), String> {
                             decoded,
                             &frame.raw,
                             telemetry.as_ref(),
+                            &mut image_reassembler,
                         ),
-                        Err(err) => eprintln!(
-                            "decode_file: failed to decode frame #{frame_count:03}: {err}"
-                        ),
+                        Err(err) => {
+                            eprintln!(
+                                "decode_file: failed to decode frame #{frame_count:03}: {err}"
+                            );
+                            let preview: Vec<String> = frame
+                                .raw
+                                .iter()
+                                .take(16)
+                                .map(|b| format!("{b:02X}"))
+                                .collect();
+                            eprintln!(
+                                "decode_file:   first {} bytes: {}",
+                                preview.len(),
+                                preview.join(" ")
+                            );
+                        }
                     }
                 }
                 BatchEntry::DecodeError(err) => {
@@ -276,6 +327,32 @@ fn run() -> Result<(), String> {
         eprintln!(
             "decode_file: ao40 sync distance per second ({} entries): {formatted}",
             history.len()
+        );
+    }
+
+    if let (Some(dir), Some(r)) = (args.dump_images.as_ref(), image_reassembler.as_ref()) {
+        let snap = r.snapshot();
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let ext = match snap.decoder {
+            ImageDecoder::Jpeg => "jpg",
+            ImageDecoder::Raw => "bin",
+        };
+        for stream in &snap.images {
+            let path = dir.join(format!("openhoshimi_image_{:02}.{ext}", stream.image_idx));
+            std::fs::write(&path, &stream.bytes)
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
+            eprintln!(
+                "decode_file: wrote {} ({} bytes, {}/{} chunks)",
+                path.display(),
+                stream.bytes.len(),
+                stream.received_count,
+                stream.total_chunks,
+            );
+        }
+        eprintln!(
+            "decode_file: dumped {} image(s) to {}",
+            snap.images.len(),
+            dir.display()
         );
     }
 
@@ -486,6 +563,7 @@ fn print_decoded_frame(
     frame: DecodedFrame,
     raw: &[u8],
     telemetry: Option<&SchemaParser>,
+    image_reassembler: &mut Option<Box<dyn ImageReassembler>>,
 ) {
     match frame {
         DecodedFrame::Ax25(ax25) => {
@@ -523,6 +601,50 @@ fn print_decoded_frame(
         DecodedFrame::Geoscan(geoscan) => {
             print_geoscan_frame(index, timestamp, &geoscan, raw);
             print_telemetry_fields(telemetry, &geoscan.payload);
+            if let Some(r) = image_reassembler.as_mut() {
+                if geoscan.crc_ok {
+                    if let Some(update) = r.ingest(&geoscan.payload) {
+                        if update.started_new_image {
+                            eprintln!(
+                                "decode_file: image #{} starts at frame {} (offset 0)",
+                                update.image_idx, index
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        DecodedFrame::Ssdv(packet) => {
+            let crc = if packet.crc_ok { "CRC ok" } else { "CRC FAIL" };
+            let kind = match packet.kind {
+                openhoshimi_codec::SsdvPacketKind::WithFec => "SSDV+FEC",
+                openhoshimi_codec::SsdvPacketKind::NoFec => "SSDV    ",
+            };
+            let rs = match packet.rs_errors {
+                Some(n) => format!("rs={}", n),
+                None => "rs=-".to_string(),
+            };
+            println!(
+                "#{index:03}  {}  {kind}             [{crc}]  cs={:<6}  img={:03}  pkt={:05}  {}x{}  {rs}",
+                format_timestamp(timestamp),
+                packet.callsign,
+                packet.image_id,
+                packet.packet_id,
+                packet.width,
+                packet.height,
+            );
+            if let Some(r) = image_reassembler.as_mut() {
+                if packet.crc_ok {
+                    if let Some(update) = r.ingest(&packet.raw) {
+                        if update.started_new_image {
+                            eprintln!(
+                                "decode_file: SSDV image #{} (id {}) starts at frame {}",
+                                update.image_idx, packet.image_id, index
+                            );
+                        }
+                    }
+                }
+            }
         }
         DecodedFrame::Raw {
             frame_type,
