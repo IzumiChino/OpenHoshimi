@@ -486,9 +486,73 @@ pub enum ByteOrderDef {
 /// A telemetry schema: the layout of fields inside a frame's payload.
 ///
 /// Schemas are referenced by name from a [`DownlinkDef::telemetry_schema`].
+///
+/// Two layout shapes are supported:
+///
+/// * **Flat schema** — a single [`fields`](Self::fields) list applied to
+///   every frame. Used by FUNcube-1 (AO-73), HADES-R, IO-117, etc.
+/// * **Variant schema** — a [`discriminator`](Self::discriminator) field
+///   selects one of [`variants`](Self::variants), each carrying its own
+///   `fields` list. Used by satellites whose beacons multiplex several
+///   subsystem layouts behind a single packet ID (LUME-1's B1..B5).
+///
+/// When a schema declares both top-level `fields` and `variants`, the
+/// variant whose `match_value` equals the discriminator wins; if no
+/// variant matches, the top-level `fields` are used as a fallback.
+///
+/// [`prefix_skip`](Self::prefix_skip) bytes are stripped from the front of
+/// the payload before any field offsets are evaluated. Discriminator
+/// offsets are evaluated against the *original* (unstripped) payload so
+/// the same TOML can describe a transport-stack header that the field
+/// schema otherwise wants to ignore.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TelemetrySchemaDef {
-    /// One entry per telemetry field in the frame.
+    /// Number of bytes to skip at the start of the payload before
+    /// applying field offsets. Defaults to `0`. Discriminator offsets are
+    /// evaluated against the unstripped payload.
+    #[serde(default)]
+    pub prefix_skip: usize,
+    /// Optional discriminator that selects one of [`variants`](Self::variants).
+    #[serde(default)]
+    pub discriminator: Option<DiscriminatorDef>,
+    /// Per-variant field layouts, keyed by discriminator value.
+    #[serde(default, rename = "variant")]
+    pub variants: Vec<TelemetryVariantDef>,
+    /// Top-level field layout, used when no discriminator matches (or
+    /// when no discriminator is configured).
+    #[serde(default, rename = "field")]
+    pub fields: Vec<TelemetryFieldDef>,
+}
+
+/// Discriminator field used by a [`TelemetrySchemaDef`] to pick a variant.
+///
+/// The discriminator is read as an unsigned big-endian or little-endian
+/// integer of `length` bytes from `offset` in the original payload (i.e.
+/// before [`TelemetrySchemaDef::prefix_skip`] is applied). `length` must
+/// be 1, 2, 4, or 8.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscriminatorDef {
+    /// Byte offset of the discriminator inside the unstripped payload.
+    pub offset: usize,
+    /// Discriminator width in bytes; must be 1, 2, 4, or 8.
+    pub length: usize,
+    /// Byte order of the discriminator value.
+    #[serde(default = "default_endian")]
+    pub endian: Endian,
+}
+
+/// One variant inside a [`TelemetrySchemaDef`] keyed by `match_value`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryVariantDef {
+    /// Short identifier for the variant (e.g. `"b1_obc"`). Surfaced to
+    /// the UI to label which variant produced a given decode.
+    #[serde(deserialize_with = "required")]
+    pub name: String,
+    /// Discriminator value that selects this variant. Compared as a
+    /// `u64` against the value read by [`DiscriminatorDef`].
+    pub match_value: u64,
+    /// Field list applied (against the prefix-stripped payload) when
+    /// this variant is selected.
     #[serde(default, rename = "field")]
     pub fields: Vec<TelemetryFieldDef>,
 }
@@ -564,6 +628,56 @@ pub struct TelemetryFieldDef {
     /// Soft upper threshold above which the field is considered abnormal.
     #[serde(default)]
     pub warn_above: Option<f64>,
+    /// If true, the raw byte value is interpreted as a two's-complement
+    /// signed integer of the same width before scale/bias are applied.
+    /// Defaults to `false` (unsigned). Only meaningful for byte-level
+    /// fields whose [`encoding`](Self::encoding) is the default integer
+    /// encoding; ignored for floats and custom encodings.
+    #[serde(default)]
+    pub signed: bool,
+    /// Custom raw-value encoding. Defaults to plain unsigned/signed
+    /// integer (per the [`signed`](Self::signed) flag). Floats and
+    /// satellite-specific encodings are selected here.
+    #[serde(default)]
+    pub encoding: FieldEncoding,
+    /// Number of decimal digits encoded in the fractional byte of a
+    /// [`FieldEncoding::BcdSplit`] field. Defaults to `1` (e.g. byte
+    /// pair `0x0C 0x03` = 12.3). Ignored for other encodings.
+    #[serde(default = "default_decimal_places")]
+    pub decimal_places: u8,
+}
+
+/// Raw-value encoding for a telemetry field.
+///
+/// The default [`Integer`](Self::Integer) encoding pulls a 1/2/4/8-byte
+/// integer in the field's byte order, then applies the field's
+/// `scale * raw^power + bias` calibration. Other encodings reinterpret
+/// the bytes before calibration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldEncoding {
+    /// Plain unsigned (or signed when [`TelemetryFieldDef::signed`] is
+    /// set) big/little-endian integer. Default.
+    #[default]
+    Integer,
+    /// IEEE-754 binary32 in the field's byte order. `length` must be 4.
+    Float32,
+    /// IEEE-754 binary64 in the field's byte order. `length` must be 8.
+    Float64,
+    /// CAMSAT BCD-split: byte 0 is the integer part, byte 1 is the
+    /// fractional part interpreted as decimal digits. The number of
+    /// decimal digits is given by the field's
+    /// [`decimal_places`](TelemetryFieldDef::decimal_places); the
+    /// engineering value is `b0 + b1 / 10^decimal_places`. `length` must
+    /// be 2.
+    BcdSplit,
+    /// 1-byte sign-magnitude temperature (CAS-5A): bit 7 is the sign
+    /// (1 = negative), bits 6..0 are the magnitude. `length` must be 1.
+    SignMagnitude8,
+    /// 2-byte signed Q15 quaternion component (CAS-5A): the bytes are
+    /// `[low, high]` in the frame, the assembled int16 is divided by
+    /// `32768.0`. `length` must be 2.
+    Q15Signed,
 }
 
 /// Byte order tag for a telemetry field.
@@ -586,6 +700,10 @@ fn default_scale() -> f64 {
 
 fn default_power() -> f64 {
     1.0
+}
+
+fn default_decimal_places() -> u8 {
+    1
 }
 
 fn default_afsk_mark_hz() -> f32 {
@@ -696,49 +814,113 @@ fn validate(def: &SatelliteDefinition) -> Result<(), ConfigError> {
 }
 
 fn validate_telemetry_schema(name: &str, schema: &TelemetrySchemaDef) -> Result<(), ConfigError> {
-    for field in &schema.fields {
+    if let Some(disc) = &schema.discriminator {
+        if !matches!(disc.length, 1 | 2 | 4 | 8) {
+            return Err(ConfigError::InvalidValue {
+                field: format!("telemetry.{name}.discriminator.length"),
+                reason: "must be 1, 2, 4, or 8".into(),
+            });
+        }
+    }
+    if !schema.variants.is_empty() && schema.discriminator.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field: format!("telemetry.{name}"),
+            reason: "variants require a discriminator".into(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for variant in &schema.variants {
+        if !seen.insert(variant.match_value) {
+            return Err(ConfigError::InvalidValue {
+                field: format!("telemetry.{name}.variant[{}].match_value", variant.name),
+                reason: "duplicate match_value".into(),
+            });
+        }
+        validate_telemetry_fields(
+            &format!("telemetry.{name}.variant[{}]", variant.name),
+            &variant.fields,
+        )?;
+    }
+    validate_telemetry_fields(&format!("telemetry.{name}"), &schema.fields)
+}
+
+fn validate_telemetry_fields(scope: &str, fields: &[TelemetryFieldDef]) -> Result<(), ConfigError> {
+    for field in fields {
         let has_byte = field.offset.is_some() || field.length.is_some();
         let has_bit = field.bit_offset.is_some() || field.bit_length.is_some();
         if has_byte && has_bit {
             return Err(ConfigError::InvalidValue {
-                field: format!("telemetry.{name}.field[{}]", field.name),
+                field: format!("{scope}.field[{}]", field.name),
                 reason: "must use either byte-level (offset/length) or bit-level (bit_offset/bit_length) addressing, not both".into(),
             });
         }
         if has_byte {
             if field.offset.is_none() || field.length.is_none() {
                 return Err(ConfigError::InvalidValue {
-                    field: format!("telemetry.{name}.field[{}]", field.name),
+                    field: format!("{scope}.field[{}]", field.name),
                     reason: "byte-level addressing requires both offset and length".into(),
                 });
             }
             if let Some(length) = field.length {
                 if length == 0 {
                     return Err(ConfigError::InvalidValue {
-                        field: format!("telemetry.{name}.field[{}].length", field.name),
+                        field: format!("{scope}.field[{}].length", field.name),
                         reason: "must be > 0".into(),
                     });
+                }
+                let required = match field.encoding {
+                    FieldEncoding::Float32 => Some(4),
+                    FieldEncoding::Float64 => Some(8),
+                    FieldEncoding::BcdSplit => Some(2),
+                    FieldEncoding::SignMagnitude8 => Some(1),
+                    FieldEncoding::Q15Signed => Some(2),
+                    FieldEncoding::Integer => None,
+                };
+                if let Some(req) = required {
+                    if length != req {
+                        return Err(ConfigError::InvalidValue {
+                            field: format!("{scope}.field[{}].length", field.name),
+                            reason: format!(
+                                "encoding {:?} requires length = {req}",
+                                field.encoding
+                            ),
+                        });
+                    }
                 }
             }
         } else if has_bit {
             if field.bit_offset.is_none() || field.bit_length.is_none() {
                 return Err(ConfigError::InvalidValue {
-                    field: format!("telemetry.{name}.field[{}]", field.name),
+                    field: format!("{scope}.field[{}]", field.name),
                     reason: "bit-level addressing requires both bit_offset and bit_length".into(),
                 });
             }
             if let Some(length) = field.bit_length {
                 if length == 0 || length > 64 {
                     return Err(ConfigError::InvalidValue {
-                        field: format!("telemetry.{name}.field[{}].bit_length", field.name),
+                        field: format!("{scope}.field[{}].bit_length", field.name),
                         reason: "must be in 1..=64".into(),
                     });
                 }
             }
+            if !matches!(field.encoding, FieldEncoding::Integer) {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("{scope}.field[{}].encoding", field.name),
+                    reason: "bit-level fields only support the integer encoding".into(),
+                });
+            }
         } else {
             return Err(ConfigError::InvalidValue {
-                field: format!("telemetry.{name}.field[{}]", field.name),
+                field: format!("{scope}.field[{}]", field.name),
                 reason: "must specify either byte-level or bit-level addressing".into(),
+            });
+        }
+        if field.encoding == FieldEncoding::BcdSplit
+            && (field.decimal_places == 0 || field.decimal_places > 9)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: format!("{scope}.field[{}].decimal_places", field.name),
+                reason: "must be in 1..=9 for bcd_split".into(),
             });
         }
     }

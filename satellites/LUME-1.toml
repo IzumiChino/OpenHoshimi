@@ -11,10 +11,23 @@
 # Golay(24,12) header carrying the encoded payload length, then a
 # CCSDS-randomized shortened RS(255,223) codeword.
 #
-# Telemetry interpretation is intentionally omitted here: the LUME-1
-# beacon payload format is mission-specific and is not yet wired up in
-# this crate. The decode chain stops at the AX100 codec, surfacing the
-# de-randomized + RS-corrected payload bytes for downstream handling.
+# Telemetry layout follows daniestevez/gr-satellites' lume telemetry
+# parser, which decodes a CSP-wrapped CCSDS TM transfer frame carrying an
+# ECSS PUS [3,25] housekeeping packet. Byte layout of the prefix:
+#
+#   off  0..3   CSP header                        (4 B)
+#   off  4..8   CCSDS TM transfer frame header    (5 B - 40 bits packed)
+#   off  9..14  CCSDS Space Packet primary header (6 B)
+#   off 15..21  ECSS PUS TM secondary header      (7 B)
+#   off 22..27  PUS time field (day:u16, ms:u32)  (6 B)
+#   off 28..29  payload id (u16be)                (2 B - discriminator)
+#   off 30..    variant payload (OBC/EPS/TTC+GSSB/AOCS/Temps by id)
+#
+# Five variants are defined keyed by the payload id:
+#   id=1 OBC, id=2 EPS, id=3 TTC+GSSB, id=4 AOCS, id=5 Temps.
+# Temperatures encoded as `LinearAdapter(10, Int16sb)` in the gr-satellites
+# construct surface here as signed s16be with `scale = 0.1` and unit "C";
+# 32-bit IEEE-754 fields surface as `encoding = "float32"`.
 
 [satellite]
 name = "LUME-1"
@@ -27,6 +40,7 @@ freq_hz = 437_250_000
 modulation = "GMSK"
 baudrate = 9600
 framing = "GOMSPACE_AX100"
+telemetry_schema = "lume_1"
 
 [downlink.modem]
 kind = "cpm"
@@ -50,3 +64,952 @@ kind = "ax100"
 [downlink.codec]
 kind = "gomspace_ax100"
 mode = "asm_golay"
+
+# Telemetry schema for LUME-1's CSP+CCSDS+PUS HK packets, mirroring the
+# gr-satellites lume.py construct (Daniel Estevez, GPL-3.0). prefix_skip = 30
+# strips the CSP header (4 B) + CCSDS TM transfer frame header (5 B) +
+# CCSDS Space Packet primary header (6 B) + ECSS PUS TM secondary header
+# (7 B) + PUS time field (6 B) + payload id (2 B) so that body offset 0
+# is the first byte of the variant payload. The discriminator at raw
+# offset 28 (length=2, big endian) selects one of five payloads:
+# id=1 OBC, id=2 EPS, id=3 TTC+GSSB, id=4 AOCS, id=5 Temps. Temperatures
+# encoded as `LinearAdapter(10, Int16sb)` in the gr-satellites construct
+# surface here as signed s16be with `scale = 0.1` and unit "C";
+# 32-bit IEEE-754 fields surface as `encoding = "float32"`. Long blob
+# fields (e.g. OBC `om_sw_version`, EPS `output_off_delta` arrays) and
+# fields whose engineering units are not documented are omitted to keep
+# the GUI readable; raw bytes can be inspected upstream of the parser.
+
+[telemetry.lume_1]
+prefix_skip = 30
+
+[telemetry.lume_1.discriminator]
+offset = 28
+length = 2
+endian = "big"
+
+# OBC housekeeping (payload id = 1, 124 B body).
+[[telemetry.lume_1.variant]]
+name = "obc"
+match_value = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "boot_cause"
+group = "obc"
+offset = 0
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "boot_count"
+group = "obc"
+offset = 4
+length = 2
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "clock"
+group = "obc"
+offset = 6
+length = 4
+endian = "big"
+unit = "s"
+
+[[telemetry.lume_1.variant.field]]
+name = "curr_flash"
+group = "obc"
+offset = 10
+length = 2
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "fs_mounted"
+group = "obc"
+offset = 12
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "ram_image"
+group = "obc"
+offset = 13
+length = 1
+signed = true
+
+[[telemetry.lume_1.variant.field]]
+name = "temp1"
+group = "temp"
+offset = 14
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+warn_below = -40.0
+warn_above = 85.0
+
+[[telemetry.lume_1.variant.field]]
+name = "temp2"
+group = "temp"
+offset = 16
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+warn_below = -40.0
+warn_above = 85.0
+
+[[telemetry.lume_1.variant.field]]
+name = "ticks"
+group = "obc"
+offset = 18
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_x"
+group = "adcs"
+offset = 22
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_y"
+group = "adcs"
+offset = 26
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_z"
+group = "adcs"
+offset = 30
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "memfree"
+group = "obc"
+offset = 34
+length = 4
+endian = "big"
+unit = "B"
+
+[[telemetry.lume_1.variant.field]]
+name = "bufferfree"
+group = "obc"
+offset = 38
+length = 4
+endian = "big"
+unit = "B"
+
+[[telemetry.lume_1.variant.field]]
+name = "uptime"
+group = "obc"
+offset = 42
+length = 4
+endian = "big"
+unit = "s"
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_x"
+group = "adcs"
+offset = 46
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_y"
+group = "adcs"
+offset = 50
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_z"
+group = "adcs"
+offset = 54
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_temp"
+group = "temp"
+offset = 58
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+warn_below = -40.0
+warn_above = 85.0
+
+[[telemetry.lume_1.variant.field]]
+name = "gpio_test"
+group = "obc"
+offset = 86
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "gpio_sw"
+group = "obc"
+offset = 87
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "gpio_pwr"
+group = "obc"
+offset = 88
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "om_state"
+group = "obc"
+offset = 89
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "op_tr_conn"
+group = "obc"
+offset = 122
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "op_tr_conn_active"
+group = "obc"
+offset = 123
+length = 1
+
+# EPS housekeeping (payload id = 2, 129 B body).
+[[telemetry.lume_1.variant]]
+name = "eps"
+match_value = 2
+
+[[telemetry.lume_1.variant.field]]
+name = "bootcause"
+group = "eps"
+offset = 34
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "cursun"
+group = "eps"
+offset = 35
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "curin_1"
+group = "eps"
+offset = 37
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "curin_2"
+group = "eps"
+offset = 39
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "curin_3"
+group = "eps"
+offset = 41
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "cursys"
+group = "eps"
+offset = 55
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "battmode"
+group = "eps"
+offset = 69
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "pptmode"
+group = "eps"
+offset = 70
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "counter_boot"
+group = "eps"
+offset = 71
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "counter_wdt_gnd"
+group = "eps"
+offset = 95
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "counter_wdt_i2c"
+group = "eps"
+offset = 99
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "wdt_gnd_time_left"
+group = "eps"
+offset = 111
+length = 4
+endian = "big"
+unit = "s"
+
+[[telemetry.lume_1.variant.field]]
+name = "wdt_i2c_time_left"
+group = "eps"
+offset = 115
+length = 4
+endian = "big"
+unit = "s"
+
+[[telemetry.lume_1.variant.field]]
+name = "vbatt"
+group = "eps"
+offset = 119
+length = 2
+endian = "big"
+unit = "mV"
+
+[[telemetry.lume_1.variant.field]]
+name = "vboost_1"
+group = "eps"
+offset = 121
+length = 2
+endian = "big"
+unit = "mV"
+
+[[telemetry.lume_1.variant.field]]
+name = "vboost_2"
+group = "eps"
+offset = 123
+length = 2
+endian = "big"
+unit = "mV"
+
+[[telemetry.lume_1.variant.field]]
+name = "vboost_3"
+group = "eps"
+offset = 125
+length = 2
+endian = "big"
+unit = "mV"
+
+# TTC + GSSB housekeeping (payload id = 3, 74 B body).
+[[telemetry.lume_1.variant]]
+name = "ttc_gssb"
+match_value = 3
+
+[[telemetry.lume_1.variant.field]]
+name = "temp_brd"
+group = "temp"
+offset = 20
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+warn_below = -40.0
+warn_above = 85.0
+
+[[telemetry.lume_1.variant.field]]
+name = "last_rferr"
+group = "comms"
+offset = 22
+length = 2
+endian = "big"
+signed = true
+unit = "Hz"
+
+[[telemetry.lume_1.variant.field]]
+name = "last_rssi"
+group = "comms"
+offset = 24
+length = 2
+endian = "big"
+signed = true
+unit = "dBm"
+
+[[telemetry.lume_1.variant.field]]
+name = "tot_rx_bytes"
+group = "comms"
+offset = 26
+length = 4
+endian = "big"
+unit = "B"
+
+[[telemetry.lume_1.variant.field]]
+name = "rx_bytes"
+group = "comms"
+offset = 30
+length = 4
+endian = "big"
+unit = "B"
+
+[[telemetry.lume_1.variant.field]]
+name = "tot_rx_count"
+group = "comms"
+offset = 34
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "rx_count"
+group = "comms"
+offset = 38
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "tot_tx_bytes"
+group = "comms"
+offset = 42
+length = 4
+endian = "big"
+unit = "B"
+
+[[telemetry.lume_1.variant.field]]
+name = "tx_bytes"
+group = "comms"
+offset = 46
+length = 4
+endian = "big"
+unit = "B"
+
+[[telemetry.lume_1.variant.field]]
+name = "tot_tx_count"
+group = "comms"
+offset = 50
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "tx_count"
+group = "comms"
+offset = 54
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "temp_pa"
+group = "temp"
+offset = 58
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+warn_below = -40.0
+warn_above = 85.0
+
+[[telemetry.lume_1.variant.field]]
+name = "boot_cause"
+group = "comms"
+offset = 60
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "bgnd_rssi"
+group = "comms"
+offset = 64
+length = 2
+endian = "big"
+signed = true
+unit = "dBm"
+
+[[telemetry.lume_1.variant.field]]
+name = "active_conf"
+group = "comms"
+offset = 66
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "boot_count"
+group = "comms"
+offset = 67
+length = 2
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "last_contact"
+group = "comms"
+offset = 69
+length = 4
+endian = "big"
+unit = "s"
+
+[[telemetry.lume_1.variant.field]]
+name = "tx_duty"
+group = "comms"
+offset = 73
+length = 1
+unit = "%"
+
+# AOCS housekeeping (payload id = 4, 85 B body).
+[[telemetry.lume_1.variant]]
+name = "aocs"
+match_value = 4
+
+[[telemetry.lume_1.variant.field]]
+name = "extmag_valid"
+group = "adcs"
+offset = 0
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "extmag_x"
+group = "adcs"
+offset = 1
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "extmag_y"
+group = "adcs"
+offset = 5
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "extmag_z"
+group = "adcs"
+offset = 9
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gps_pos_x"
+group = "gps"
+offset = 25
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gps_pos_y"
+group = "gps"
+offset = 29
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gps_pos_z"
+group = "gps"
+offset = 33
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gps_valid"
+group = "gps"
+offset = 37
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_valid"
+group = "adcs"
+offset = 38
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_x"
+group = "adcs"
+offset = 39
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_y"
+group = "adcs"
+offset = 43
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "gyro_z"
+group = "adcs"
+offset = 47
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_x"
+group = "adcs"
+offset = 51
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_y"
+group = "adcs"
+offset = 55
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_z"
+group = "adcs"
+offset = 59
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "mag_valid"
+group = "adcs"
+offset = 63
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "status_run"
+group = "adcs"
+offset = 64
+length = 1
+signed = true
+
+[[telemetry.lume_1.variant.field]]
+name = "acs_mode"
+group = "adcs"
+offset = 65
+length = 1
+signed = true
+
+[[telemetry.lume_1.variant.field]]
+name = "ads_mode"
+group = "adcs"
+offset = 66
+length = 1
+signed = true
+
+[[telemetry.lume_1.variant.field]]
+name = "ephem_mode"
+group = "adcs"
+offset = 67
+length = 1
+signed = true
+
+[[telemetry.lume_1.variant.field]]
+name = "bdot_detumb"
+group = "adcs"
+offset = 68
+length = 1
+
+[[telemetry.lume_1.variant.field]]
+name = "boot_cause"
+group = "adcs"
+offset = 69
+length = 4
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "boot_count"
+group = "adcs"
+offset = 73
+length = 2
+endian = "big"
+
+[[telemetry.lume_1.variant.field]]
+name = "cur_gssb_1"
+group = "adcs"
+offset = 75
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "cur_gssb_2"
+group = "adcs"
+offset = 77
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "cur_pwm"
+group = "adcs"
+offset = 79
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "cur_gps"
+group = "adcs"
+offset = 81
+length = 2
+endian = "big"
+unit = "mA"
+
+[[telemetry.lume_1.variant.field]]
+name = "cur_wde"
+group = "adcs"
+offset = 83
+length = 2
+endian = "big"
+unit = "mA"
+
+# Temps housekeeping (payload id = 5, 92 B body). Five `aocs_suns` and
+# five `aocs_fss` floats are exposed; the documented `not_used` gaps in
+# the gr-satellites construct are skipped.
+[[telemetry.lume_1.variant]]
+name = "temps"
+match_value = 5
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_sun_1"
+group = "adcs"
+offset = 0
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_sun_2"
+group = "adcs"
+offset = 4
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_sun_3"
+group = "adcs"
+offset = 8
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_sun_4"
+group = "adcs"
+offset = 12
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_sun_5"
+group = "adcs"
+offset = 16
+length = 4
+endian = "big"
+encoding = "float32"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_extmag"
+group = "temp"
+offset = 24
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_fss_1"
+group = "temp"
+offset = 28
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_fss_2"
+group = "temp"
+offset = 32
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_fss_3"
+group = "temp"
+offset = 36
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_fss_4"
+group = "temp"
+offset = 40
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_fss_5"
+group = "temp"
+offset = 44
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_gyro"
+group = "temp"
+offset = 60
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_1"
+group = "temp"
+offset = 64
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "aocs_2"
+group = "temp"
+offset = 66
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "eps_1"
+group = "temp"
+offset = 68
+length = 2
+endian = "big"
+signed = true
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "eps_2"
+group = "temp"
+offset = 70
+length = 2
+endian = "big"
+signed = true
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "eps_3"
+group = "temp"
+offset = 72
+length = 2
+endian = "big"
+signed = true
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "eps_4"
+group = "temp"
+offset = 74
+length = 2
+endian = "big"
+signed = true
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "eps_5"
+group = "temp"
+offset = 76
+length = 2
+endian = "big"
+signed = true
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "eps_6"
+group = "temp"
+offset = 78
+length = 2
+endian = "big"
+signed = true
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "obc_1"
+group = "temp"
+offset = 80
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "obc_2"
+group = "temp"
+offset = 82
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "obc_gyro"
+group = "temp"
+offset = 84
+length = 4
+endian = "big"
+encoding = "float32"
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "ttc_brd"
+group = "temp"
+offset = 88
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
+
+[[telemetry.lume_1.variant.field]]
+name = "ttc_pa"
+group = "temp"
+offset = 90
+length = 2
+endian = "big"
+signed = true
+scale = 0.1
+unit = "C"
