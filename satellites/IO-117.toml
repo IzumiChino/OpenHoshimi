@@ -1,0 +1,86 @@
+# IO-117 / GreenCube satellite definition.
+#
+# Reference: https://gr-satellites.readthedocs.io/en/latest/supported_satellites.html
+#            https://www.qrz.com/db/IS0GRB
+#            https://www.amsat.org/news/2023/02/13/greencube-given-international-designator-io-117/
+#
+# Italian 1U CubeSat from Sapienza University of Rome (S5Lab),
+# launched 2022-07-13 on Vega-C from Kourou. Coordinated by IARU as
+# IO-117 in 2023 once the amateur digital store-and-forward bulletin
+# board was opened to all licensed amateurs. The satellite occupies a
+# medium Earth orbit (~6000 km), giving it intercontinental footprints
+# rare for an amateur cubesat and making it one of the most popular
+# amateur digital satellites in operation.
+#
+# Downlink at 435.310 MHz uses plain FSK with the GOMspace AX100
+# framing (32-bit attached sync marker 0x930B51DE, 3-byte Golay(24,12)
+# header, 255-byte CCSDS-randomised RS(255,223) codeword). The SatNOGS
+# transmitter database labels these as "GMSK" colloquially, but the
+# gr-satellites GREENCUBE definition and the on-air signal are
+# rectangular-pulse FSK (no transmit Gaussian filter); the matched
+# receive filter is therefore a square-pulse / integrate-and-dump
+# stage, not a Gaussian one. Configuring the runtime modem with plain
+# FSK and no `gaussian_bt` selects that path.
+#
+# gr-satellites lists six baudrate variants (300, 600, 1k2, 2k4, 4k8,
+# 9k6); operationally the digipeater runs at 1k2 most of the time, with
+# experimental 9k6 slots announced by the operator. We declare two
+# downlink rows so the GUI can pick the one matching the recording.
+#
+# Telemetry interpretation is intentionally omitted: the on-orbit packet
+# format is documented in the GreenCube user manual but is not yet wired
+# up here. The decode chain stops at the AX100 codec, surfacing the
+# decoded RS(255,223) payload + corrected-error count for inspection.
+
+[satellite]
+name = "IO-117"
+aliases = ["GreenCube", "GREENCUBE", "ITASAT-2"]
+norad_id = 53106
+
+[[downlink]]
+label = "1k2 FSK digipeater"
+freq_hz = 435_310_000
+modulation = "FSK"
+baudrate = 1200
+framing = "GOMSPACE_AX100"
+
+[downlink.modem]
+kind = "cpm"
+mode = "fsk"
+modulation_index = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.framer]
+kind = "ax100_asm"
+threshold = 4
+
+[downlink.codec]
+kind = "gomspace_ax100"
+mode = "asm_golay"
+
+[[downlink]]
+label = "9k6 FSK digipeater"
+freq_hz = 435_310_000
+modulation = "FSK"
+baudrate = 9600
+framing = "GOMSPACE_AX100"
+
+[downlink.modem]
+kind = "cpm"
+mode = "fsk"
+modulation_index = 0.5
+frequency_offset_hz = 0.0
+differential = false
+invert = false
+swap_iq = false
+
+[downlink.framer]
+kind = "ax100_asm"
+threshold = 4
+
+[downlink.codec]
+kind = "gomspace_ax100"
+mode = "asm_golay"
