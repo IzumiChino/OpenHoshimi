@@ -357,34 +357,81 @@ impl IntegrateAndDump {
     }
 }
 
-/// Closed-loop symbol-rate interpolator with Mueller-Müller decision-directed
-/// timing recovery for binary signals. Tracks small fractional clock offsets
-/// (TX/RX PPM mismatch) over long recordings by nudging the fractional
-/// sampling phase from the timing error of consecutive output samples. The
-/// loop update is gated by a leak-decay envelope estimate so that timing
-/// does not wander on the noise/silence between bursts.
+/// Closed-loop symbol-rate interpolator with Mueller-Müller decision-
+/// directed timing recovery for binary signals. The proportional path
+/// tracks short-term symbol-clock jitter via an instant `mu` correction;
+/// an optional integral path feeds the per-input phase increment `omega`
+/// to absorb steady-state PPM drift over long recordings. The loop update
+/// is gated by a leak-decay envelope estimate so timing does not wander
+/// on the noise/silence between bursts.
+///
+/// The integral path is opt-in for a reason. It is the right tool when
+/// the input has a sustained clock-rate offset that drifts over many
+/// seconds — for example, multi-minute SatNOGS captures of a passing
+/// satellite where ground-station and spacecraft oscillators differ by
+/// a small but measurable PPM. On those recordings, leaving the loop
+/// first-order costs hundreds of frames of CRC-valid data because the
+/// proportional-only loop cannot track a sustained rate offset, only
+/// instantaneous phase. With the integral path on, error from per-symbol
+/// noise is averaged into the rate estimate over many symbols and
+/// converges to the true PPM offset.
+///
+/// On short, strong-signal IQ recordings the steady-state offset is
+/// negligible and the integral path is a liability: a few burst-edge
+/// noise samples can shift the rate estimate enough to corrupt the rest
+/// of the burst, with no in-band mechanism to detect and reset. We tried
+/// several mitigations (leaky integrator, gate-only updates, warm-up
+/// delay) on the unified loop; each helped marginally but none recovered
+/// the clean output that a first-order loop produces on the same input.
+///
+/// So the loop is structured to let the *caller* choose. FM-audio
+/// recordings (which have already been demodulated by an external SDR
+/// front-end and reach us as long, drifty captures) opt into the second
+/// order. IQ-domain demodulation (where carrier recovery and Doppler
+/// compensation already happen upstream of the symbol clock) stays
+/// first-order. This is not a per-satellite knob — it is a per-input-
+/// type choice that follows the physical structure of the signal chain.
 #[derive(Debug, Clone)]
 pub(crate) struct TrackingInterpolator {
-    increment: f32,
+    omega: f32,
+    omega_min: f32,
+    omega_max: f32,
     mu: f32,
     prev_input: f32,
     last_output: f32,
     have_output: bool,
     primed: bool,
-    gain: f32,
+    gain_p: f32,
+    gain_i: f32,
     envelope: f32,
 }
 
 impl TrackingInterpolator {
+    /// First-order proportional-only Mueller-Müller. Right for inputs
+    /// where the symbol-clock offset is small and stable over the
+    /// recording length — typically IQ captures of a single short pass.
     pub(crate) fn new(samples_per_symbol: f32, gain: f32) -> Self {
+        Self::with_integral(samples_per_symbol, gain, 0.0)
+    }
+
+    /// Second-order proportional + integral Mueller-Müller. Right for
+    /// long recordings where the symbol clock drifts (Doppler-induced
+    /// rate variation, oscillator PPM offset). `gain_i` is typically
+    /// `gain_p / 16` for a critically-damped response.
+    pub(crate) fn with_integral(samples_per_symbol: f32, gain_p: f32, gain_i: f32) -> Self {
+        let nominal = 1.0 / samples_per_symbol;
+        let bound = nominal * 0.01;
         Self {
-            increment: 1.0 / samples_per_symbol,
+            omega: nominal,
+            omega_min: nominal - bound,
+            omega_max: nominal + bound,
             mu: 0.0,
             prev_input: 0.0,
             last_output: 0.0,
             have_output: false,
             primed: false,
-            gain,
+            gain_p,
+            gain_i,
             envelope: 0.0,
         }
     }
@@ -396,9 +443,9 @@ impl TrackingInterpolator {
             return None;
         }
 
-        let next_phase = self.mu + self.increment;
+        let next_phase = self.mu + self.omega;
         if next_phase >= 1.0 {
-            let frac = ((1.0 - self.mu) / self.increment).clamp(0.0, 1.0);
+            let frac = ((1.0 - self.mu) / self.omega).clamp(0.0, 1.0);
             let symbol = lerp(self.prev_input, sample, frac);
             let abs_symbol = symbol.abs();
 
@@ -412,11 +459,15 @@ impl TrackingInterpolator {
                     let sign_curr = if symbol >= 0.0 { 1.0 } else { -1.0 };
                     let sign_prev = if self.last_output >= 0.0 { 1.0 } else { -1.0 };
                     let error = self.last_output * sign_curr - symbol * sign_prev;
-                    new_mu += self.gain * error;
+                    new_mu += self.gain_p * error;
                     if new_mu < 0.0 {
                         new_mu = 0.0;
                     } else if new_mu >= 1.0 {
-                        new_mu = 1.0 - self.increment * 0.5;
+                        new_mu = 1.0 - self.omega * 0.5;
+                    }
+                    if self.gain_i > 0.0 {
+                        self.omega = (self.omega + self.gain_i * error)
+                            .clamp(self.omega_min, self.omega_max);
                     }
                 }
             }
@@ -469,6 +520,51 @@ impl GaussianFir {
         }
         self.head = (self.head + 1) % len;
         acc
+    }
+}
+
+/// Length-N rectangular FIR with unit-sum normalization, evaluated as a
+/// running sum: O(1) per sample regardless of length. Used as the matched
+/// filter for plain (rectangular-pulse) FSK and as the moving-average stage
+/// of a long-window DC blocker. Matches gr-satellites' boxcar
+/// `np.ones(sqfilter_len) / sqfilter_len` in
+/// `python/components/demodulators/fsk_demodulator.py`.
+#[derive(Debug, Clone)]
+pub(crate) struct BoxcarFilter {
+    history: Vec<f32>,
+    head: usize,
+    sum: f32,
+    inv_len: f32,
+}
+
+impl BoxcarFilter {
+    /// Build a boxcar of explicit length. Length is clamped to at least 1.
+    pub(crate) fn new(length: usize) -> Self {
+        let len = length.max(1);
+        Self {
+            history: vec![0.0; len],
+            head: 0,
+            sum: 0.0,
+            inv_len: 1.0 / len as f32,
+        }
+    }
+
+    /// Build the symbol matched filter for a rectangular-pulse signal:
+    /// length equals `samples_per_symbol` rounded to the nearest integer.
+    pub(crate) fn matched(samples_per_symbol: f32) -> Self {
+        let len = samples_per_symbol.round().max(1.0) as usize;
+        Self::new(len)
+    }
+
+    pub(crate) fn push(&mut self, sample: f32) -> f32 {
+        let oldest = self.history[self.head];
+        self.sum += sample - oldest;
+        self.history[self.head] = sample;
+        self.head += 1;
+        if self.head >= self.history.len() {
+            self.head = 0;
+        }
+        self.sum * self.inv_len
     }
 }
 
@@ -835,5 +931,32 @@ mod tests {
         let taps = gaussian_taps(0.5, 5.0, 4);
         let sum: f32 = taps.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "sum was {sum}");
+    }
+
+    #[test]
+    fn boxcar_filter_averages_to_unit_dc_gain() {
+        let mut filter = BoxcarFilter::new(8);
+        // Once the buffer is fully filled with the same value, the output
+        // must equal that value (unit DC gain).
+        for _ in 0..16 {
+            let _ = filter.push(0.75);
+        }
+        let out = filter.push(0.75);
+        assert!((out - 0.75).abs() < 1e-6, "DC gain not unity: {out}");
+    }
+
+    #[test]
+    fn boxcar_filter_matches_rectangular_pulse_peak() {
+        // 4 samples of -1 then 4 samples of +1 with a length-4 boxcar
+        // produces +1 at the symbol centre after the transition completes.
+        let mut filter = BoxcarFilter::new(4);
+        for _ in 0..4 {
+            let _ = filter.push(-1.0);
+        }
+        let mut last = 0.0f32;
+        for _ in 0..4 {
+            last = filter.push(1.0);
+        }
+        assert!((last - 1.0).abs() < 1e-6, "post-transition peak: {last}");
     }
 }

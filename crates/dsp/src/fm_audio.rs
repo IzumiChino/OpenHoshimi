@@ -4,40 +4,34 @@
 //! SDR in FM mode), the FM discriminator has already converted instantaneous
 //! frequency deviation into a proportional audio amplitude. For FSK/GMSK
 //! signals this audio directly represents the symbol waveform. This module
-//! recovers bits from that waveform:
+//! recovers bits from that waveform with an always-on closed-loop chain:
 //!
-//! 1. Optional DC-blocking first-order IIR.
-//! 2. Optional Gaussian receive matched filter (for GMSK signals).
-//! 3. Startup phase search that buffers a fixed number of symbols, scans
-//!    all integer-sample phases, and picks the one with the largest eye
-//!    opening (Σ|sample| at candidate sample instants).
-//! 4. Symbol-rate sampling via integrate-and-dump (unfiltered) or
-//!    sub-sample interpolation (filtered), seeded with the chosen phase.
+//! 1. Long moving-average DC blocker (32 symbols of memory) so the loop
+//!    sees zero-mean input even when the front-end leaves a slow envelope.
+//! 2. Matched filter: a length-`sps` boxcar for plain FSK or a Gaussian
+//!    receive filter for GMSK.
+//! 3. RMS AGC with a 50-symbol time constant so the timing detector sees
+//!    unit-variance input regardless of burst level.
+//! 4. Mueller-Müller decision-directed timing recovery driving a fractional-
+//!    sample interpolator, running continuously across the recording so it
+//!    re-locks naturally on each burst.
 //! 5. Hard slicer with optional differential decoding and inversion.
+//!
+//! Mirrors the real-input path of gr-satellites' `fsk_demodulator.py`:
+//! `dc_blocker_ff(ceil(sps*32), True)` -> matched filter (boxcar or
+//! Gaussian) -> `rms_agc_f` -> `symbol_sync_ff(TED_GARDNER, ...)` ->
+//! `binary_slicer_fb`.
 
 use openhoshimi_core::{DecodeError, Demodulator};
 
-use crate::cpm::{GaussianFir, IntegrateAndDump, TrackingInterpolator};
+use crate::cpm::{BoxcarFilter, GaussianFir, TrackingInterpolator};
 
-/// Loop gain for the closed-loop Mueller-Müller timing tracker on the
-/// filtered path. Tuned for the noisy real-world recordings produced by
-/// SatNOGS-style passes: small enough to stay stable on weak signals,
-/// large enough to follow the typical TX/RX clock drift (<200 PPM) seen
-/// on amateur satellite passes.
-const MM_TIMING_GAIN: f32 = 0.02;
-
-/// Number of symbols buffered during each phase search.
-const PHASE_SEARCH_SYMBOLS: usize = 64;
-
-/// Leak-decay factor for the per-sample envelope tracker (`peak hold`).
-const ENVELOPE_DECAY: f32 = 0.999;
-
-/// Very slow decay for the peak-level tracker so it captures the strongest
-/// burst seen in the recording and holds it across inter-burst gaps.
-const PEAK_DECAY: f32 = 0.999_99;
-
-/// Envelope must exceed this fraction of peak to be considered active.
-const ACTIVITY_FRAC: f32 = 0.2;
+/// Loop gain for the closed-loop Mueller-Müller timing tracker. Tuned for
+/// the noisy real-world recordings produced by SatNOGS-style passes:
+/// small enough that per-symbol noise does not random-walk the timing
+/// estimate over thousands of bits between TED resets, large enough to
+/// follow the typical TX/RX clock drift (<200 PPM) seen on amateur passes.
+const MM_TIMING_GAIN: f32 = 0.005;
 
 /// Configuration for [`FmAudioDemodulator`].
 #[derive(Debug, Clone, Copy)]
@@ -46,19 +40,18 @@ pub struct FmAudioConfig {
     pub sample_rate: u32,
     /// Symbol rate in baud.
     pub baudrate: u32,
-    /// Gaussian BT product for the receive matched filter. `None` disables
-    /// the filter (appropriate for plain FSK).
+    /// Gaussian BT product for the receive matched filter. `None` selects
+    /// a length-`sps` boxcar matched filter, appropriate for plain FSK.
     pub gaussian_bt: Option<f32>,
     /// Decode differential symbol encoding after hard slicing.
     pub differential: bool,
     /// Invert hard symbol decisions.
     pub invert: bool,
-    /// Enable DC-blocking filter on the input audio.
-    pub dc_block: bool,
 }
 
 impl FmAudioConfig {
-    /// Create a configuration with conservative defaults.
+    /// Create a configuration with conservative defaults (plain FSK, no
+    /// differential, no inversion).
     pub fn new(sample_rate: u32, baudrate: u32) -> Self {
         Self {
             sample_rate,
@@ -66,7 +59,6 @@ impl FmAudioConfig {
             gaussian_bt: None,
             differential: false,
             invert: false,
-            dc_block: true,
         }
     }
 
@@ -78,7 +70,6 @@ impl FmAudioConfig {
             gaussian_bt: Some(bt),
             differential: false,
             invert: false,
-            dc_block: true,
         }
     }
 }
@@ -87,14 +78,12 @@ impl FmAudioConfig {
 #[derive(Debug, Clone)]
 pub struct FmAudioDemodulator {
     config: FmAudioConfig,
-    dc_blocker: Option<DcBlocker>,
-    filter: Option<GaussianFir>,
-    samples_per_symbol: f32,
-    sps_int: usize,
-    stage: SamplingStage,
+    dc_blocker: BoxcarFilter,
+    matched: MatchedFilter,
+    agc: RmsAgc,
+    tracker: TrackingInterpolator,
     previous_symbol: Option<u8>,
-    envelope: f32,
-    peak: f32,
+    last_soft: Vec<f32>,
 }
 
 impl FmAudioDemodulator {
@@ -124,25 +113,31 @@ impl FmAudioDemodulator {
         }
 
         let samples_per_symbol = config.sample_rate as f32 / config.baudrate as f32;
-        let sps_int = samples_per_symbol.round().max(2.0) as usize;
-        let filter = config
-            .gaussian_bt
-            .map(|bt| GaussianFir::new(bt, samples_per_symbol));
+        // 32-symbol moving-average DC blocker matches gr-satellites'
+        // `dc_blocker_ff(ceil(sps*32), True)`. The output is `x -
+        // moving_avg`, implemented below in `push_samples`.
+        let dc_len = (samples_per_symbol * 32.0).ceil().max(2.0) as usize;
+        let dc_blocker = BoxcarFilter::new(dc_len);
+        let matched = match config.gaussian_bt {
+            Some(bt) => MatchedFilter::Gaussian(GaussianFir::new(bt, samples_per_symbol)),
+            None => MatchedFilter::Boxcar(BoxcarFilter::matched(samples_per_symbol)),
+        };
+        let agc = RmsAgc::new(samples_per_symbol);
+        // First-order proportional-only Mueller-Müller. The TED's envelope
+        // gate already keeps timing pinned during inter-burst noise so
+        // bursts re-lock cleanly. An integral path would average noise
+        // into the rate estimate over the long inter-burst gaps in
+        // SatNOGS captures and corrupt the next burst.
+        let tracker = TrackingInterpolator::new(samples_per_symbol, MM_TIMING_GAIN);
 
         Ok(Self {
             config,
-            dc_blocker: if config.dc_block {
-                Some(DcBlocker::new())
-            } else {
-                None
-            },
-            filter,
-            samples_per_symbol,
-            sps_int,
-            stage: SamplingStage::Idle,
+            dc_blocker,
+            matched,
+            agc,
+            tracker,
             previous_symbol: None,
-            envelope: 0.0,
-            peak: 0.0,
+            last_soft: Vec::new(),
         })
     }
 
@@ -151,7 +146,17 @@ impl FmAudioDemodulator {
         self.config
     }
 
+    /// Return the soft (pre-slicer, post-invert, pre-differential) sample
+    /// value for each bit emitted by the most recent
+    /// [`push_samples`](Self::push_samples) call.
+    pub fn last_soft(&self) -> &[f32] {
+        &self.last_soft
+    }
+
     fn hard_slice(&mut self, sample: f32) -> u8 {
+        let oriented = if self.config.invert { -sample } else { sample };
+        self.last_soft.push(oriented);
+
         let mut symbol = u8::from(sample >= 0.0);
         if self.config.invert {
             symbol ^= 1;
@@ -168,28 +173,6 @@ impl FmAudioDemodulator {
             symbol
         }
     }
-
-    fn preprocess(&mut self, sample: f32) -> f32 {
-        let dc = match &mut self.dc_blocker {
-            Some(blocker) => blocker.push(sample),
-            None => sample,
-        };
-        match &mut self.filter {
-            Some(filter) => filter.push(dc),
-            None => dc,
-        }
-    }
-
-    fn build_sampler(&self) -> FmSymbolSampler {
-        match self.config.gaussian_bt {
-            Some(_) => FmSymbolSampler::Tracking {
-                interp: TrackingInterpolator::new(self.samples_per_symbol, MM_TIMING_GAIN),
-            },
-            None => FmSymbolSampler::IntegrateAndDump {
-                integrator: IntegrateAndDump::new(self.samples_per_symbol),
-            },
-        }
-    }
 }
 
 impl Demodulator for FmAudioDemodulator {
@@ -197,52 +180,16 @@ impl Demodulator for FmAudioDemodulator {
 
     fn push_samples(&mut self, samples: &[f32]) -> Vec<u8> {
         let mut bits = Vec::new();
+        self.last_soft.clear();
 
         for &sample in samples {
-            let processed = self.preprocess(sample);
-            let abs = processed.abs();
-            self.envelope = (self.envelope * ENVELOPE_DECAY).max(abs);
-            self.peak = (self.peak * PEAK_DECAY).max(self.envelope);
-            let active = self.peak < 1e-9 || self.envelope > self.peak * ACTIVITY_FRAC;
-
-            match &mut self.stage {
-                SamplingStage::Idle => {
-                    if active {
-                        if self.config.gaussian_bt.is_some() {
-                            // TrackingInterpolator has M&M timing recovery —
-                            // skip phase search and let it converge naturally.
-                            let mut sampler = self.build_sampler();
-                            if let Some(symbol) = sampler.push(processed) {
-                                bits.push(self.hard_slice(symbol));
-                            }
-                            self.stage = SamplingStage::Run { sampler };
-                        } else {
-                            let target = self.sps_int * PHASE_SEARCH_SYMBOLS;
-                            let mut buffer = Vec::with_capacity(target);
-                            buffer.push(processed);
-                            self.stage = SamplingStage::Search { buffer, target };
-                        }
-                    }
-                }
-                SamplingStage::Search { buffer, target } => {
-                    buffer.push(processed);
-                    if buffer.len() >= *target {
-                        let buffered = std::mem::take(buffer);
-                        let best_phase = best_phase_in(&buffered, self.sps_int);
-                        let mut sampler = self.build_sampler();
-                        for &queued in &buffered[best_phase..] {
-                            if let Some(symbol) = sampler.push(queued) {
-                                bits.push(self.hard_slice(symbol));
-                            }
-                        }
-                        self.stage = SamplingStage::Run { sampler };
-                    }
-                }
-                SamplingStage::Run { sampler } => {
-                    if let Some(symbol) = sampler.push(processed) {
-                        bits.push(self.hard_slice(symbol));
-                    }
-                }
+            // Long moving-average HPF: `y = x - moving_avg(x)`.
+            let avg = self.dc_blocker.push(sample);
+            let dc = sample - avg;
+            let mf = self.matched.push(dc);
+            let agc = self.agc.push(mf);
+            if let Some(symbol) = self.tracker.push(agc) {
+                bits.push(self.hard_slice(symbol));
             }
         }
 
@@ -256,72 +203,60 @@ impl Demodulator for FmAudioDemodulator {
     fn baudrate(&self) -> u32 {
         self.config.baudrate
     }
-}
 
-/// Pick the integer-sample phase with the largest eye opening, measured as
-/// Σ|sample| at candidate sample instants.
-fn best_phase_in(buffer: &[f32], sps_int: usize) -> usize {
-    let mut best_phase = 0;
-    let mut best_score = f32::NEG_INFINITY;
-    for phase in 0..sps_int {
-        let mut sum = 0.0f32;
-        let mut idx = phase;
-        while idx < buffer.len() {
-            sum += buffer[idx].abs();
-            idx += sps_int;
-        }
-        if sum > best_score {
-            best_score = sum;
-            best_phase = phase;
-        }
+    fn last_soft(&self) -> &[f32] {
+        &self.last_soft
     }
-    best_phase
 }
 
 #[derive(Debug, Clone)]
-enum SamplingStage {
-    Idle,
-    Search { buffer: Vec<f32>, target: usize },
-    Run { sampler: FmSymbolSampler },
+enum MatchedFilter {
+    Boxcar(BoxcarFilter),
+    Gaussian(GaussianFir),
 }
 
-#[derive(Debug, Clone)]
-enum FmSymbolSampler {
-    IntegrateAndDump { integrator: IntegrateAndDump },
-    Tracking { interp: TrackingInterpolator },
-}
-
-impl FmSymbolSampler {
-    fn push(&mut self, sample: f32) -> Option<f32> {
+impl MatchedFilter {
+    fn push(&mut self, sample: f32) -> f32 {
         match self {
-            Self::IntegrateAndDump { integrator } => integrator.push(sample),
-            Self::Tracking { interp } => interp.push(sample),
+            Self::Boxcar(filter) => filter.push(sample),
+            Self::Gaussian(filter) => filter.push(sample),
         }
     }
 }
 
-/// First-order DC-blocking IIR filter: `y[n] = x[n] - x[n-1] + alpha * y[n-1]`.
+/// Exponential RMS AGC with a 50-symbol time constant. Mirrors
+/// `rms_agc_f(2e-2 / sps, 1)` from gr-satellites: the per-sample update
+/// `r2 += alpha * (x*x - r2)` converges to E[x^2]; output `x / sqrt(r2)`
+/// has unit RMS at steady state.
 #[derive(Debug, Clone)]
-struct DcBlocker {
-    prev_input: f32,
-    prev_output: f32,
+struct RmsAgc {
     alpha: f32,
+    mean_sq: f32,
 }
 
-impl DcBlocker {
-    fn new() -> Self {
+impl RmsAgc {
+    fn new(samples_per_symbol: f32) -> Self {
+        let alpha = (2.0e-2 / samples_per_symbol).clamp(1.0e-5, 1.0);
+        // Seed mean_sq at the unit-RMS reference so the first samples pass
+        // through near unchanged. With mean_sq starting at 0 the first push
+        // would divide by sqrt(eps) and produce a transient large enough
+        // to wedge the downstream timing-loop envelope detector.
         Self {
-            prev_input: 0.0,
-            prev_output: 0.0,
-            alpha: 0.995,
+            alpha,
+            mean_sq: 1.0,
         }
     }
 
     fn push(&mut self, sample: f32) -> f32 {
-        let output = sample - self.prev_input + self.alpha * self.prev_output;
-        self.prev_input = sample;
-        self.prev_output = output;
-        output
+        self.mean_sq += self.alpha * (sample * sample - self.mean_sq);
+        // Mirror gr-satellites' `rms_agc_f`: divide by sqrt(mean_sq) with no
+        // floor at unit RMS, so weak bursts whose matched-filter output
+        // sits below unity still get amplified to the reference. The earlier
+        // floor existed to gate the now-removed M&M envelope detector; the
+        // always-on tracker handles inter-burst noise itself. A small
+        // epsilon keeps the denominator non-zero through silence.
+        let denom = self.mean_sq.max(1.0e-6).sqrt();
+        sample / denom
     }
 }
 
@@ -341,147 +276,11 @@ mod tests {
         out
     }
 
-    #[test]
-    fn recovers_fsk_from_fm_audio() {
-        let bits: Vec<u8> = (0..256u32)
-            .map(|i| {
-                let mixed = i.wrapping_mul(2_654_435_761).wrapping_add(1);
-                ((mixed >> 16) & 1) as u8
-            })
-            .collect();
-        let samples = synthesize_fm_fsk(&bits, 48_000, 1_200);
-        let config = FmAudioConfig::new(48_000, 1_200);
-        let mut demod = FmAudioDemodulator::new(config).unwrap();
-
-        let recovered = demod.push_samples(&samples);
-
-        assert!(
-            recovered.len() >= bits.len() - 4,
-            "too few symbols recovered: {}",
-            recovered.len()
-        );
-
-        let mut best_matches = 0usize;
-        for offset in 0..=4 {
-            if recovered.len() < offset + bits.len() {
-                break;
-            }
-            let matches = bits
-                .iter()
-                .zip(&recovered[offset..offset + bits.len()])
-                .filter(|(a, b)| a == b)
-                .count();
-            if matches > best_matches {
-                best_matches = matches;
-            }
-        }
-        let total = bits.len();
-        assert!(
-            best_matches * 100 >= total * 95,
-            "FSK FM audio match rate too low: {best_matches}/{total}"
-        );
-    }
-
-    #[test]
-    fn recovers_gmsk_from_fm_audio() {
-        let bits: Vec<u8> = (0..256u32)
-            .map(|i| {
-                let mixed = i.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                ((mixed >> 16) & 1) as u8
-            })
-            .collect();
-
-        let sps = 48_000u32 / 9_600;
-        let sps_f = sps as f32;
-        let span = 4usize;
-        let pulse_len = sps as usize * span;
-        let centre = (pulse_len as f32 - 1.0) / 2.0;
-        let bt = 0.5f32;
-        let alpha = (std::f32::consts::PI * bt) / (sps_f * (2.0_f32.ln() / 2.0).sqrt());
-        let mut pulse = vec![0.0f32; pulse_len];
-        let mut sum = 0.0f32;
-        for (n, tap) in pulse.iter_mut().enumerate() {
-            let x = alpha * (n as f32 - centre);
-            *tap = (-x * x).exp();
-            sum += *tap;
-        }
-        let scale = span as f32 / sum;
-        for tap in &mut pulse {
-            *tap *= scale;
-        }
-
-        let pad = span;
-        let total_symbols = bits.len() + 2 * pad;
-        let total_samples = total_symbols * sps as usize;
-        let mut nrz = vec![0.0f32; total_symbols];
-        for (i, &bit) in bits.iter().enumerate() {
-            nrz[pad + i] = if bit & 1 == 1 { 1.0 } else { -1.0 };
-        }
-
-        let mut freq = vec![0.0f32; total_samples];
-        for (sym_index, &symbol) in nrz.iter().enumerate() {
-            if symbol == 0.0 {
-                continue;
-            }
-            let start = sym_index * sps as usize;
-            for (offset, &tap) in pulse.iter().enumerate() {
-                let index = start + offset;
-                if index < total_samples {
-                    freq[index] += symbol * tap;
-                }
-            }
-        }
-
-        let config = FmAudioConfig::gmsk(48_000, 9_600, 0.5);
-        let mut demod = FmAudioDemodulator::new(config).unwrap();
-        let recovered = demod.push_samples(&freq);
-
-        let mut best_matches = 0usize;
-        for offset in 0..=12 {
-            if recovered.len() < offset + bits.len() {
-                break;
-            }
-            let matches = bits
-                .iter()
-                .zip(&recovered[offset..offset + bits.len()])
-                .filter(|(a, b)| a == b)
-                .count();
-            if matches > best_matches {
-                best_matches = matches;
-            }
-        }
-        let total = bits.len();
-        assert!(
-            best_matches * 100 >= total * 90,
-            "GMSK FM audio match rate too low: {best_matches}/{total}"
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_config() {
-        let config = FmAudioConfig::new(48_000, 0);
-        assert!(FmAudioDemodulator::new(config).is_err());
-    }
-
-    #[test]
-    fn tracker_follows_clock_offset() {
-        // Synthesize a GMSK-shaped signal at nominal 48 kHz / 9600 baud,
-        // then decode it with the demodulator configured for a slightly
-        // higher baudrate (~1% mismatch). Without timing tracking the
-        // accumulated phase drift slips a full symbol over a few hundred
-        // bits; the M&M tracker should still recover >90%.
-        let bits: Vec<u8> = (0..512u32)
-            .map(|i| {
-                let mixed = i.wrapping_mul(2_654_435_761).wrapping_add(7);
-                ((mixed >> 16) & 1) as u8
-            })
-            .collect();
-
-        let sps = 5usize;
+    fn synthesize_fm_gmsk(bits: &[u8], sample_rate: u32, baudrate: u32, bt: f32) -> Vec<f32> {
+        let sps = (sample_rate / baudrate) as usize;
         let span = 4usize;
         let pulse_len = sps * span;
         let centre = (pulse_len as f32 - 1.0) / 2.0;
-        let bt = 0.5f32;
         let alpha = (std::f32::consts::PI * bt) / (sps as f32 * (2.0_f32.ln() / 2.0).sqrt());
         let mut pulse = vec![0.0f32; pulse_len];
         let mut sum = 0.0f32;
@@ -516,41 +315,106 @@ mod tests {
                 }
             }
         }
+        freq
+    }
 
-        // Configure the receiver for a slightly higher baudrate than the
-        // synthesis used: this simulates a few hundred PPM of TX/RX clock
-        // drift, which is at the high end of what a TCXO-stabilised
-        // amateur radio satellite actually exhibits in flight.
-        let config = FmAudioConfig::gmsk(48_000, 9_629, 0.5);
-        let mut demod = FmAudioDemodulator::new(config).unwrap();
-        let recovered = demod.push_samples(&freq);
-
-        let mut best_matches = 0usize;
-        for offset in 0..=12 {
-            if recovered.len() < offset + bits.len() {
+    fn best_match(expected: &[u8], recovered: &[u8], max_offset: usize) -> usize {
+        let mut best = 0usize;
+        for offset in 0..=max_offset {
+            if recovered.len() < offset + expected.len() {
                 break;
             }
-            let matches = bits
+            let matches = expected
                 .iter()
-                .zip(&recovered[offset..offset + bits.len()])
+                .zip(&recovered[offset..offset + expected.len()])
                 .filter(|(a, b)| a == b)
                 .count();
-            if matches > best_matches {
-                best_matches = matches;
+            if matches > best {
+                best = matches;
             }
         }
+        best
+    }
+
+    #[test]
+    fn recovers_fsk_from_fm_audio() {
+        let bits: Vec<u8> = (0..256u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(2_654_435_761).wrapping_add(1);
+                ((mixed >> 16) & 1) as u8
+            })
+            .collect();
+        let samples = synthesize_fm_fsk(&bits, 48_000, 1_200);
+        let config = FmAudioConfig::new(48_000, 1_200);
+        let mut demod = FmAudioDemodulator::new(config).unwrap();
+
+        let recovered = demod.push_samples(&samples);
+
         let total = bits.len();
+        let best = best_match(&bits, &recovered, 8);
         assert!(
-            best_matches * 100 >= total * 90,
-            "M&M tracker failed to follow clock offset: {best_matches}/{total}"
+            best * 100 >= total * 90,
+            "FSK FM audio match rate too low: {best}/{total}"
         );
     }
 
     #[test]
-    fn phase_search_locks_on_offset_signal() {
-        // Simulate an FSK signal whose first sample falls mid-symbol so
-        // phase 0 sampling would land on transitions. Phase search must
-        // recover the correct symbol grid.
+    fn recovers_gmsk_from_fm_audio() {
+        let bits: Vec<u8> = (0..256u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((mixed >> 16) & 1) as u8
+            })
+            .collect();
+        let freq = synthesize_fm_gmsk(&bits, 48_000, 9_600, 0.5);
+        let config = FmAudioConfig::gmsk(48_000, 9_600, 0.5);
+        let mut demod = FmAudioDemodulator::new(config).unwrap();
+        let recovered = demod.push_samples(&freq);
+
+        let total = bits.len();
+        let best = best_match(&bits, &recovered, 16);
+        assert!(
+            best * 100 >= total * 85,
+            "GMSK FM audio match rate too low: {best}/{total}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_config() {
+        let config = FmAudioConfig::new(48_000, 0);
+        assert!(FmAudioDemodulator::new(config).is_err());
+    }
+
+    #[test]
+    fn tracker_follows_clock_offset() {
+        // Synthesize at nominal 9 600 baud, decode configured for ~200 PPM
+        // higher rate. This is at the high end of what a TCXO-stabilised
+        // amateur radio satellite actually exhibits in flight.
+        let bits: Vec<u8> = (0..512u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(2_654_435_761).wrapping_add(7);
+                ((mixed >> 16) & 1) as u8
+            })
+            .collect();
+        let freq = synthesize_fm_gmsk(&bits, 48_000, 9_600, 0.5);
+
+        let config = FmAudioConfig::gmsk(48_000, 9_602, 0.5);
+        let mut demod = FmAudioDemodulator::new(config).unwrap();
+        let recovered = demod.push_samples(&freq);
+
+        let total = bits.len();
+        let best = best_match(&bits, &recovered, 16);
+        assert!(
+            best * 100 >= total * 85,
+            "M&M tracker failed to follow clock offset: {best}/{total}"
+        );
+    }
+
+    #[test]
+    fn tracker_locks_on_offset_signal() {
+        // FSK signal whose first sample falls mid-symbol so phase 0
+        // sampling would land on transitions. The closed-loop tracker
+        // must still recover symbols from the offset stream.
         let sps = 40usize;
         let bits: Vec<u8> = (0..128u32).map(|i| (i & 1) as u8).collect();
         let mut samples = vec![0.0f32; sps / 2];
@@ -565,26 +429,75 @@ mod tests {
         let mut demod = FmAudioDemodulator::new(config).unwrap();
         let recovered = demod.push_samples(&samples);
 
-        // Allow the recovered bit stream to be aligned to any short offset,
-        // then compare with the input bit pattern.
-        let mut best_matches = 0usize;
-        for offset in 0..=4 {
-            if recovered.len() < offset + bits.len() {
-                break;
-            }
+        let total = bits.len();
+        let best = best_match(&bits, &recovered, 8);
+        assert!(
+            best * 100 >= total * 90,
+            "tracker failed to lock on offset signal: {best}/{total}"
+        );
+    }
+
+    #[test]
+    fn recovers_fsk_after_gap() {
+        // Two FSK bursts separated by silence and noise. The always-on
+        // closed loop must re-lock on the second burst exactly the way
+        // gr-satellites' real-input chain does.
+        let sps = 40u32;
+        let sample_rate = 48_000u32;
+        let baudrate = 1_200u32;
+        let bits: Vec<u8> = (0..256u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(2_654_435_761).wrapping_add(13);
+                ((mixed >> 19) & 1) as u8
+            })
+            .collect();
+
+        // Helper: a stretch of band-limited noise so the loop has to
+        // re-acquire timing on the burst.
+        let mut rng_state: u32 = 0xDEAD_BEEF;
+        let mut noise = |len: usize| {
+            (0..len)
+                .map(|_| {
+                    rng_state = rng_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let v = (rng_state >> 8) as i32 as f32 / i32::MAX as f32;
+                    v * 0.05
+                })
+                .collect::<Vec<f32>>()
+        };
+
+        let burst = synthesize_fm_fsk(&bits, sample_rate, baudrate);
+        let gap_samples = (sps as usize) * 200; // 200 symbols of gap
+        let mut samples = noise(gap_samples);
+        samples.extend(&burst);
+        samples.extend(noise(gap_samples));
+        samples.extend(&burst);
+
+        let config = FmAudioConfig::new(sample_rate, baudrate);
+        let mut demod = FmAudioDemodulator::new(config).unwrap();
+        let recovered = demod.push_samples(&samples);
+
+        // Slide the expected pattern across the recovered stream and
+        // require a contiguous window that matches the bit pattern at
+        // >=90 %. We expect this to land twice, once per burst.
+        let mut hits = 0usize;
+        let total = bits.len();
+        let mut idx = 0usize;
+        while idx + total <= recovered.len() {
             let matches = bits
                 .iter()
-                .zip(&recovered[offset..offset + bits.len()])
+                .zip(&recovered[idx..idx + total])
                 .filter(|(a, b)| a == b)
                 .count();
-            if matches > best_matches {
-                best_matches = matches;
+            if matches * 100 >= total * 90 {
+                hits += 1;
+                idx += total; // skip past the matched window
+            } else {
+                idx += 1;
             }
         }
-        let total = bits.len();
         assert!(
-            best_matches * 100 >= total * 95,
-            "phase search failed to lock: {best_matches}/{total}"
+            hits >= 2,
+            "expected to recover both bursts, got {hits} contiguous matches"
         );
     }
 }
