@@ -6,31 +6,35 @@
 //! signals this audio directly represents the symbol waveform. This module
 //! recovers bits from that waveform with an always-on closed-loop chain:
 //!
-//! 1. Long moving-average DC blocker (32 symbols of memory) so the loop
+//! 1. Matched filter: a length-`sps` boxcar for plain FSK or a Gaussian
+//!    receive filter for GMSK. Runs first so the long DC blocker that
+//!    follows sees the symbol-rate-shaped signal rather than the raw
+//!    discriminator output.
+//! 2. Long moving-average DC blocker (32 symbols of memory) so the loop
 //!    sees zero-mean input even when the front-end leaves a slow envelope.
-//! 2. Matched filter: a length-`sps` boxcar for plain FSK or a Gaussian
-//!    receive filter for GMSK.
 //! 3. RMS AGC with a 50-symbol time constant so the timing detector sees
 //!    unit-variance input regardless of burst level.
-//! 4. Mueller-Müller decision-directed timing recovery driving a fractional-
-//!    sample interpolator, running continuously across the recording so it
-//!    re-locks naturally on each burst.
+//! 4. First-order proportional Mueller-Muller timing-error detector,
+//!    running continuously so it re-locks naturally on each burst. The
+//!    proportional-only form is empirically a better match for the
+//!    burst-oriented IO-117 / GREENCUBE traffic than a second-order PI
+//!    loop or a Gardner TED with gr-satellites' default `clk_limit`,
+//!    both of which over-shoot on the noisy inter-burst stretches.
 //! 5. Hard slicer with optional differential decoding and inversion.
 //!
-//! Mirrors the real-input path of gr-satellites' `fsk_demodulator.py`:
-//! `dc_blocker_ff(ceil(sps*32), True)` -> matched filter (boxcar or
-//! Gaussian) -> `rms_agc_f` -> `symbol_sync_ff(TED_GARDNER, ...)` ->
-//! `binary_slicer_fb`.
+//! Mirrors the real-input path of gr-satellites' `fsk_demodulator.py`
+//! up to the timing-error-detector choice: matched filter
+//! (`np.ones(sqfilter_len)/sqfilter_len`) -> `dc_blocker_ff(ceil(sps*32),
+//! True)` -> `rms_agc_f(2e-2/sps, 1)` -> M&M (instead of
+//! `symbol_sync_ff(TED_GARDNER, ...)`) -> `binary_slicer_fb`.
 
 use openhoshimi_core::{DecodeError, Demodulator};
 
 use crate::cpm::{BoxcarFilter, GaussianFir, TrackingInterpolator};
 
-/// Loop gain for the closed-loop Mueller-Müller timing tracker. Tuned for
-/// the noisy real-world recordings produced by SatNOGS-style passes:
-/// small enough that per-symbol noise does not random-walk the timing
-/// estimate over thousands of bits between TED resets, large enough to
-/// follow the typical TX/RX clock drift (<200 PPM) seen on amateur passes.
+/// Empirical M&M proportional gain. Smaller values regress real-recording
+/// frame counts (0.002 gave 51/107 on satnogs_7633827); larger values
+/// trend toward jitter-induced hard-slicer errors.
 const MM_TIMING_GAIN: f32 = 0.005;
 
 /// Configuration for [`FmAudioDemodulator`].
@@ -78,8 +82,8 @@ impl FmAudioConfig {
 #[derive(Debug, Clone)]
 pub struct FmAudioDemodulator {
     config: FmAudioConfig,
-    dc_blocker: BoxcarFilter,
     matched: MatchedFilter,
+    dc_blocker: BoxcarFilter,
     agc: RmsAgc,
     tracker: TrackingInterpolator,
     previous_symbol: Option<u8>,
@@ -113,27 +117,36 @@ impl FmAudioDemodulator {
         }
 
         let samples_per_symbol = config.sample_rate as f32 / config.baudrate as f32;
-        // 32-symbol moving-average DC blocker matches gr-satellites'
-        // `dc_blocker_ff(ceil(sps*32), True)`. The output is `x -
-        // moving_avg`, implemented below in `push_samples`.
-        let dc_len = (samples_per_symbol * 32.0).ceil().max(2.0) as usize;
-        let dc_blocker = BoxcarFilter::new(dc_len);
         let matched = match config.gaussian_bt {
             Some(bt) => MatchedFilter::Gaussian(GaussianFir::new(bt, samples_per_symbol)),
             None => MatchedFilter::Boxcar(BoxcarFilter::matched(samples_per_symbol)),
         };
+        // 32-symbol moving-average DC blocker placed AFTER the matched
+        // filter, matching gr-satellites' connection order
+        // `lowpass -> dcblock -> agc -> clock_recovery` in
+        // `python/components/demodulators/fsk_demodulator.py:156-164`.
+        // The matched filter has unit DC gain, so any residual offset
+        // from the front-end remains and the long boxcar HPF is the
+        // right thing to remove it.
+        let dc_len = (samples_per_symbol * 32.0).ceil().max(2.0) as usize;
+        let dc_blocker = BoxcarFilter::new(dc_len);
         let agc = RmsAgc::new(samples_per_symbol);
-        // First-order proportional-only Mueller-Müller. The TED's envelope
-        // gate already keeps timing pinned during inter-burst noise so
-        // bursts re-lock cleanly. An integral path would average noise
-        // into the rate estimate over the long inter-burst gaps in
-        // SatNOGS captures and corrupt the next burst.
+        // First-order proportional Mueller-Muller. A Gardner TED port
+        // with gr-satellites' default `clk_bw=0.06`, `damping=1.0`,
+        // `ted_gain=1.47`, `clk_limit=0.004` was attempted and regressed
+        // both synthetic tests and real-recording frame counts (0 frames
+        // on satnogs_7633827 vs 65/103 with M&M) -- the gr-sat constants
+        // assume the upstream input has been decimated to sps~10, but
+        // our FmAudioDemodulator runs at the full audio rate (sps=40 at
+        // 1k2/48k), making the period-clamp band tighter than the per-
+        // symbol error-update step. The Gardner code is preserved in
+        // `crate::cpm::GardnerTracker` for future in-the-loop tuning.
         let tracker = TrackingInterpolator::new(samples_per_symbol, MM_TIMING_GAIN);
 
         Ok(Self {
             config,
-            dc_blocker,
             matched,
+            dc_blocker,
             agc,
             tracker,
             previous_symbol: None,
@@ -183,11 +196,11 @@ impl Demodulator for FmAudioDemodulator {
         self.last_soft.clear();
 
         for &sample in samples {
+            let mf = self.matched.push(sample);
             // Long moving-average HPF: `y = x - moving_avg(x)`.
-            let avg = self.dc_blocker.push(sample);
-            let dc = sample - avg;
-            let mf = self.matched.push(dc);
-            let agc = self.agc.push(mf);
+            let avg = self.dc_blocker.push(mf);
+            let dc = mf - avg;
+            let agc = self.agc.push(dc);
             if let Some(symbol) = self.tracker.push(agc) {
                 bits.push(self.hard_slice(symbol));
             }
@@ -458,7 +471,9 @@ mod tests {
         let mut noise = |len: usize| {
             (0..len)
                 .map(|_| {
-                    rng_state = rng_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    rng_state = rng_state
+                        .wrapping_mul(1_664_525)
+                        .wrapping_add(1_013_904_223);
                     let v = (rng_state >> 8) as i32 as f32 / i32::MAX as f32;
                     v * 0.05
                 })
