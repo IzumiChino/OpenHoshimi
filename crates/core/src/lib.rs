@@ -57,6 +57,16 @@ pub trait Demodulator: Send {
 
     /// Symbol rate of the demodulated signal, in baud.
     fn baudrate(&self) -> u32;
+
+    /// Optional pre-slicer soft (signed) sample value for each bit emitted
+    /// by the most recent [`push_samples`](Self::push_samples) call. The
+    /// default returns an empty slice for demodulators that do not expose
+    /// soft information; demodulators that can must return a slice whose
+    /// length matches the bit vector returned by `push_samples`. Sign
+    /// matches the bit (positive -> `1`, negative -> `0`).
+    fn last_soft(&self) -> &[f32] {
+        &[]
+    }
 }
 
 /// Decodes a line-coded bit stream in place.
@@ -95,6 +105,17 @@ pub trait Framing: Send {
     /// Push bytes through the framer and return any complete frames that
     /// were recovered as a result. The vector may be empty.
     fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Frame>;
+
+    /// Push pre-slicer soft (signed) symbol values, one per symbol, through
+    /// a soft-decision detector and return any frames recovered.
+    ///
+    /// The default implementation returns an empty vector. Framers that can
+    /// usefully exploit soft information (notably syncword-based framers at
+    /// low SNR) override this method. Pipelines that do not have soft
+    /// information available simply do not call this method.
+    fn push_soft(&mut self, _soft: &[f32]) -> Vec<Frame> {
+        Vec::new()
+    }
 }
 
 /// Parses a raw [`Frame`] into human-readable telemetry fields.
@@ -167,6 +188,11 @@ pub struct Frame {
     pub raw: Vec<u8>,
     /// Framing protocol that produced this frame.
     pub frame_type: FrameType,
+    /// Per-bit soft confidence for `raw`, MSB-first within each byte.
+    /// Length is `raw.len() * 8` when present. `None` when the framer
+    /// or demodulator did not produce soft samples; codec stages that
+    /// can use them (AX.100 erasure RS) fall back to hard decision.
+    pub soft_bits: Option<Vec<f32>>,
 }
 
 /// The framing protocol a [`Frame`] was decoded from.

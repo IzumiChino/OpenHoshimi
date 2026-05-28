@@ -200,6 +200,7 @@ impl Framing for Ao40Framer {
                     rssi_dbm: None,
                     raw,
                     frame_type: FrameType::Ao40Fec,
+                    soft_bits: None,
                 });
             }
         }

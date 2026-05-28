@@ -219,6 +219,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![0x01, 0x58, 0x74, 0x0b, 0x01],
             frame_type: openhoshimi_core::FrameType::Ax25,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -243,6 +244,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![0x08, 0x34],
             frame_type: openhoshimi_core::FrameType::Ax25,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -259,6 +261,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![0x0f],
             frame_type: openhoshimi_core::FrameType::Ax25,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -290,6 +293,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![0x7f],
             frame_type: openhoshimi_core::FrameType::Unknown,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -321,6 +325,7 @@ mod tests {
             rssi_dbm: None,
             raw: (0u8..17).collect(),
             frame_type: openhoshimi_core::FrameType::Unknown,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -386,6 +391,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![0b1100_1100, 0b1010_1010, 0b1100_0000],
             frame_type: openhoshimi_core::FrameType::Unknown,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -421,6 +427,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![100],
             frame_type: openhoshimi_core::FrameType::Unknown,
+            soft_bits: None,
         };
 
         let fields = parser.parse(&frame);
@@ -462,6 +469,7 @@ mod tests {
             rssi_dbm: None,
             raw: vec![0u8; 9],
             frame_type: openhoshimi_core::FrameType::Unknown,
+            soft_bits: None,
         };
         let fields = parser.parse(&frame);
         assert!(fields.is_empty(), "oversized bit_length should be rejected");

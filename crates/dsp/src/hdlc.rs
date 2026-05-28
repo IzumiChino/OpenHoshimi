@@ -146,6 +146,7 @@ impl Framing for HdlcFramer {
                             rssi_dbm: None,
                             raw,
                             frame_type: FrameType::Ax25,
+                            soft_bits: None,
                         });
                     }
                     Err(err) => {
