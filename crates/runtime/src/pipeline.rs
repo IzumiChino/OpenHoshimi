@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use openhoshimi_codec::{
     ax100_syncword, Ao40FecDecoder, Ax100Decoder, Ax100Mode, Ax25Decoder, Ax25Frame, Callsign,
-    GeoscanDecoder, GeoscanFrame,
+    GeoscanDecoder, GeoscanFrame, SsdvDecoder,
 };
 use openhoshimi_core::satellite::{
     Ax100ModeDef, CodecDef, CpmModeDef, DescramblerDef, DownlinkDef, FramerDef, LineCodingDef,
@@ -94,6 +94,9 @@ pub enum DecodedFrame {
     },
     /// Geoscan custom frame (CC11xx PN9-descrambled fixed-size payload).
     Geoscan(GeoscanFrame),
+    /// SSDV image packet (256-byte JPEG MCU slice with optional
+    /// Reed-Solomon trailer).
+    Ssdv(openhoshimi_codec::SsdvPacket),
     /// Raw frame bytes from an unsupported codec.
     Raw {
         /// Raw frame type.
@@ -185,6 +188,7 @@ pub fn frame_type_label(frame_type: FrameType) -> &'static str {
         FrameType::Ccsds => "ccsds",
         FrameType::Fx25 => "fx25",
         FrameType::Geoscan => "geoscan",
+        FrameType::Ssdv => "ssdv",
         FrameType::Unknown => "unknown",
     }
 }
@@ -197,6 +201,7 @@ pub fn frame_type_for_codec(downlink: &DownlinkDef) -> FrameType {
         Some(CodecKind::GomspaceAx100(_)) => FrameType::GomspaceAx100,
         Some(CodecKind::Ccsds) => FrameType::Ccsds,
         Some(CodecKind::Geoscan) => FrameType::Geoscan,
+        Some(CodecKind::Ssdv) => FrameType::Ssdv,
         Some(CodecKind::Unknown) | None => FrameType::Unknown,
     }
 }
@@ -967,7 +972,24 @@ where
             descrambler.descramble(&mut bits);
         }
         self.total_bits = self.total_bits.saturating_add(bits.len() as u64);
-        let frames = self.framer.push_bits(&bits);
+        // Prefer soft-decision syncword detection when no per-bit transform
+        // (line decoder, descrambler) sits between the demodulator and the
+        // framer. The soft buffer from the demodulator is 1:1 aligned with
+        // `bits`, so it carries the same content but with confidence info
+        // the correlator can use to lock onto bursts the hard Hamming
+        // detector misses.
+        let frames = if self.line_decoder.is_none() && self.descrambler.is_none() {
+            let soft = demodulator.last_soft();
+            if soft.len() == bits.len() {
+                self.framer
+                    .push_soft(soft)
+                    .unwrap_or_else(|| self.framer.push_bits(&bits))
+            } else {
+                self.framer.push_bits(&bits)
+            }
+        } else {
+            self.framer.push_bits(&bits)
+        };
         self.frames_emitted = self.frames_emitted.saturating_add(frames.len() as u64);
         frames
     }
@@ -1253,6 +1275,18 @@ impl FrameStage {
         }
     }
 
+    /// Push soft-decision symbol values into the framer's syncword
+    /// detector. Currently only [`SyncwordFramer`] takes advantage of
+    /// soft input — the others fall through to a hard slice. Returns
+    /// `None` to mean "this framer doesn't have a meaningful soft path,
+    /// caller should use `push_bits` on hard slices instead".
+    fn push_soft(&mut self, soft: &[f32]) -> Option<Vec<Frame>> {
+        match self {
+            Self::Syncword(framer) => Some(Framing::push_soft(framer, soft)),
+            Self::Ao40(_) | Self::Hdlc(_) => None,
+        }
+    }
+
     fn last_error(&self) -> Option<&DecodeError> {
         match self {
             Self::Ao40(_) => None,
@@ -1401,6 +1435,7 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
         Some(CodecDef::Unknown) => Some(CodecKind::Unknown),
         Some(CodecDef::Ccsds) => Some(CodecKind::Ccsds),
         Some(CodecDef::Geoscan) => Some(CodecKind::Geoscan),
+        Some(CodecDef::Ssdv) => Some(CodecKind::Ssdv),
         Some(CodecDef::Fx25) => None,
         None if matches_token(&downlink.framing, &["AX25", "AX.25", "HDLC"]) => {
             Some(CodecKind::Ax25)
@@ -1410,6 +1445,7 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
             Some(CodecKind::GomspaceAx100(Ax100Mode::AsmGolay))
         }
         None if downlink.framing.eq_ignore_ascii_case("GEOSCAN") => Some(CodecKind::Geoscan),
+        None if downlink.framing.eq_ignore_ascii_case("SSDV") => Some(CodecKind::Ssdv),
         None if downlink.framing.eq_ignore_ascii_case("UNKNOWN") => Some(CodecKind::Unknown),
         None => None,
     }
@@ -1421,6 +1457,7 @@ enum CodecKind {
     GomspaceAx100(Ax100Mode),
     Ccsds,
     Geoscan,
+    Ssdv,
     Unknown,
 }
 
@@ -1433,6 +1470,7 @@ enum CodecStage {
     },
     Ccsds,
     Geoscan(GeoscanDecoder),
+    Ssdv(SsdvDecoder),
     Unknown,
 }
 
@@ -1455,11 +1493,39 @@ impl CodecStage {
                 })
             }
             Self::Ax100 { decoder, mode } => {
-                let frame = match mode {
+                let frame_result = match mode {
                     Ax100Mode::ReedSolomon => decoder.decode_reed_solomon(&frame.raw),
                     Ax100Mode::AsmGolay => decoder.decode_asm_golay(&frame.raw),
-                }
-                .map_err(|err| format!("AX100 decode failed: {err}"))?;
+                };
+                // For ASM+Golay packets that fail hard-decision RS, retry
+                // with soft-decision erasure marking when the framer
+                // produced per-bit soft samples. K is the number of
+                // weakest bytes flagged as erasures. RS(255,223) has
+                // d-1=32 of correction budget (2t + E ≤ 32), and on
+                // the IO-117 9k6 SatNOGS recording the soft
+                // confidences track real errors closely enough that
+                // K=32 (every weak byte erased, any remaining
+                // mismatch must be inside the erased set) recovered
+                // 5/12 frames vs 0 with hard-decision alone. K=31
+                // notably regresses to 0 because one missed error
+                // pushes the codeword past 2t+E=32; K=30 recovers 3.
+                // K=32 is the empirical default — sweep via
+                // OPENHOSHIMI_AX100_ERASURE_K to retune for other
+                // captures.
+                let erasure_k = std::env::var("OPENHOSHIMI_AX100_ERASURE_K")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(32);
+                let frame_result = match (frame_result, *mode, frame.soft_bits.as_deref()) {
+                    (Ok(frame), _, _) => Ok(frame),
+                    (Err(_), Ax100Mode::AsmGolay, Some(soft))
+                        if soft.len() == frame.raw.len() * 8 && erasure_k > 0 =>
+                    {
+                        decoder.decode_asm_golay_with_soft(&frame.raw, soft, erasure_k)
+                    }
+                    (Err(err), _, _) => Err(err),
+                };
+                let frame = frame_result.map_err(|err| format!("AX100 decode failed: {err}"))?;
                 Ok(DecodedFrame::Ax100 {
                     mode: frame.mode,
                     payload: frame.payload,
@@ -1471,6 +1537,12 @@ impl CodecStage {
                     .decode_frame(frame)
                     .map_err(|err| format!("Geoscan decode failed: {err}"))?;
                 Ok(DecodedFrame::Geoscan(geoscan))
+            }
+            Self::Ssdv(decoder) => {
+                let packet = decoder
+                    .decode(&frame.raw)
+                    .map_err(|err| format!("SSDV decode failed: {err}"))?;
+                Ok(DecodedFrame::Ssdv(packet))
             }
             Self::Ccsds | Self::Unknown => Ok(DecodedFrame::Raw {
                 frame_type: frame.frame_type,
@@ -1490,6 +1562,7 @@ fn build_codec(downlink: &DownlinkDef) -> Result<CodecStage, String> {
         }),
         Some(CodecKind::Ccsds) => Ok(CodecStage::Ccsds),
         Some(CodecKind::Geoscan) => Ok(CodecStage::Geoscan(GeoscanDecoder::new())),
+        Some(CodecKind::Ssdv) => Ok(CodecStage::Ssdv(SsdvDecoder::new())),
         Some(CodecKind::Unknown) => Ok(CodecStage::Unknown),
         None => Err(format!("{} has no supported codec", downlink.label)),
     }

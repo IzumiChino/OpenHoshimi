@@ -10,4 +10,5 @@ description = "Frame decoders (AX.25, AO-40 FEC, ...) for OpenHoshimi"
 
 [dependencies]
 openhoshimi-core = { workspace = true }
+openhoshimi-dsp = { workspace = true }
 crc = { workspace = true }

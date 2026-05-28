@@ -16,3 +16,6 @@ openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
 rayon = { workspace = true }
 
+[dev-dependencies]
+crc = "3"
+

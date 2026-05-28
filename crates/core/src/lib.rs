@@ -211,6 +211,10 @@ pub enum FrameType {
     /// Geoscan custom CC11xx frame format (32-bit syncword + fixed-size
     /// payload + CRC, hardware-whitened with PN9).
     Geoscan,
+    /// SSDV (Slow-Scan Digital Video) packet: 256-byte fixed-size
+    /// frame carrying a JPEG MCU slice with an optional Reed-Solomon
+    /// trailer.
+    Ssdv,
     /// Frame whose framing is unknown or not yet classified.
     Unknown,
 }

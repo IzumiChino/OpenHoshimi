@@ -1974,6 +1974,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2694,6 +2703,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_extras",
+ "jpeg-decoder",
  "openhoshimi-codec",
  "openhoshimi-core",
  "openhoshimi-dsp",
@@ -2711,6 +2721,7 @@ version = "0.1.0"
 dependencies = [
  "crc",
  "openhoshimi-core",
+ "openhoshimi-dsp",
 ]
 
 [[package]]
@@ -2744,6 +2755,7 @@ dependencies = [
 name = "openhoshimi-runtime"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "openhoshimi-codec",
  "openhoshimi-core",
  "openhoshimi-dsp",
@@ -3590,6 +3602,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "syncword_scan"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "openhoshimi-core",
+ "openhoshimi-dsp",
+ "openhoshimi-io",
 ]
 
 [[package]]

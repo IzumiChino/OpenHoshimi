@@ -335,6 +335,10 @@ pub enum CodecDef {
     /// Geoscan custom frame decoder (CC11xx PN9 descrambling +
     /// CC11xx CRC16 over a fixed-size payload).
     Geoscan,
+    /// SSDV (Slow-Scan Digital Video) packet decoder. Operates on
+    /// 256-byte packets carrying a JPEG MCU slice with optional
+    /// Reed-Solomon parity. See `crates/codec/src/ssdv.rs`.
+    Ssdv,
     /// Unknown or unsupported frame decoder.
     Unknown,
 }
@@ -353,7 +357,7 @@ pub enum Ax100ModeDef {
 ///
 /// When a downlink carries images split across many small frames, the
 /// runtime hands each decoded payload to a stateful reassembler that
-/// drops it into the correct slot of a per-group canvas. v1 only supports
+/// drops it into the correct slot of a per-image canvas. v1 only supports
 /// the Geoscan custom protocol used by STRATOSAT-TK-1 and Geoscan-Edelveis;
 /// SSDV and other protocols arrive as additional variants of this enum.
 #[derive(Debug, Clone, Deserialize)]
@@ -361,8 +365,11 @@ pub enum Ax100ModeDef {
 pub enum ImageDef {
     /// Geoscan custom protocol: each frame begins with a fixed
     /// `header_signature`, followed by a 16-bit `packet_offset` field
-    /// (byte offset into the linear pixel buffer), a `subsystem` group id,
-    /// and a fixed-length raw chunk.
+    /// (byte offset into the linear image buffer) and a fixed-length raw
+    /// chunk. The protocol does not carry an explicit image id; new
+    /// images are detected by the offset returning to zero (with the
+    /// chunk starting with the `decoder`'s start-of-image marker, e.g.
+    /// the JPEG `FF D8` SOI).
     Geoscan {
         /// Header bytes that must appear at the start of an image frame's
         /// payload. Whitespace is ignored. Frames whose first
@@ -372,26 +379,72 @@ pub enum ImageDef {
         /// Byte location, length, and endianness of the packet-offset
         /// field inside the frame payload.
         offset_field: ImageField,
-        /// Byte location and length of the subsystem / group-id field
-        /// inside the frame payload. Endianness is irrelevant for
-        /// 1-byte fields and follows `offset_field` rules otherwise.
-        group_field: ImageField,
         /// First byte of the raw image chunk inside the frame payload.
         chunk_at: usize,
         /// Length of the raw image chunk in bytes (typically 56 for the
         /// 64-byte Geoscan payload).
         chunk_bytes: usize,
-        /// Canvas width in pixels. Defaults to 320.
+        /// How to interpret the reassembled byte stream when rendering
+        /// or saving. `Jpeg` decodes a compressed JPEG bitstream and lets
+        /// the canvas size follow the image header; `Raw` lays the bytes
+        /// out as raw pixels using `width`/`height`/`pixel_format`.
+        /// Defaults to `Jpeg` because the only known producer
+        /// (STRATOSAT-TK-1 / Geoscan-Edelveis) sends JPEG.
+        #[serde(default)]
+        decoder: ImageDecoderDef,
+        /// Canvas width in pixels. Used only when `decoder = "raw"`.
+        /// Defaults to 320.
         #[serde(default = "default_image_width")]
         width: u32,
-        /// Canvas height in pixels. Defaults to 240.
+        /// Canvas height in pixels. Used only when `decoder = "raw"`.
+        /// Defaults to 240.
         #[serde(default = "default_image_height")]
         height: u32,
-        /// Pixel format used to interpret raw chunk bytes. Defaults to
-        /// `Gray8`.
+        /// Pixel format used to interpret raw chunk bytes. Used only
+        /// when `decoder = "raw"`. Defaults to `Gray8`.
         #[serde(default)]
         pixel_format: PixelFormatDef,
     },
+    /// SSDV protocol: each frame's payload is a complete 256-byte
+    /// SSDV packet (sync byte, type, base-40 callsign, image_id,
+    /// packet_id, geometry, payload, CRC32, optional Reed-Solomon
+    /// parity). The reassembler multiplexes by `image_id`, slots
+    /// payloads into per-`packet_id` buckets, and lazily builds a
+    /// JPEG bitstream with placeholder MCUs for missing packets.
+    Ssdv {
+        /// Optional callsign filter; when set, packets whose
+        /// decoded callsign does not match are ignored. Set when a
+        /// downlink legitimately carries traffic from multiple
+        /// senders and the operator wants to track one.
+        #[serde(default)]
+        callsign: Option<String>,
+    },
+    /// Slow-Scan Television (SSTV) audio image. Pixel intensity is
+    /// encoded as audio frequency on a 1500-2300 Hz ramp; the mode
+    /// (Robot36, PD120, ...) is auto-detected from the 30-bit VIS
+    /// code at the start of each transmission. SSTV is fundamentally
+    /// not a bit pipeline - the runtime feeds raw audio samples
+    /// directly to a [`crate`-`adjacent`] `SstvAnalyzer` instead of
+    /// going through demodulator / framer / codec stages, so an
+    /// SSTV downlink legitimately omits all three. The presence of
+    /// this `[downlink.image]` block is the signal that the SSTV
+    /// runtime path should be used.
+    Sstv {},
+}
+
+/// Decoder applied to the reassembled byte stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDecoderDef {
+    /// Reassembled bytes are a JPEG bitstream. Image-boundary detection
+    /// looks for the JPEG SOI marker (`FF D8`) in the first chunk of a
+    /// stream that arrived at offset 0.
+    #[default]
+    Jpeg,
+    /// Reassembled bytes are raw pixels in the `pixel_format` layout.
+    /// Image-boundary detection falls back to "offset returned to 0
+    /// after the canvas had data".
+    Raw,
 }
 
 /// Location of a fixed integer field inside a frame payload.
@@ -620,7 +673,7 @@ pub fn load_all_satellites(dir: &Path) -> Result<Vec<SatelliteDefinition>, Confi
 
 fn validate(def: &SatelliteDefinition) -> Result<(), ConfigError> {
     for d in &def.downlinks {
-        if d.baudrate == 0 {
+        if d.baudrate == 0 && !matches!(d.image, Some(ImageDef::Sstv {})) {
             return Err(ConfigError::InvalidValue {
                 field: format!("downlink[{}].baudrate", d.label),
                 reason: "must be > 0".into(),
@@ -1080,5 +1133,37 @@ payload_bits = 8
         };
         assert_eq!(defs.len(), 1, "only the good file should load");
         assert_eq!(defs[0].satellite.name, "AO-73");
+    }
+
+    #[test]
+    fn sstv_downlink_loads_without_pipeline_stages() {
+        // SSTV downlinks have no modem/framer/codec and a meaningless
+        // baudrate; only the [downlink.image] block with protocol "sstv"
+        // is mandatory. The validator must accept this shape.
+        let toml = r#"
+[satellite]
+name = "ISS"
+norad_id = 25544
+
+[[downlink]]
+label = "SSTV image"
+freq_hz = 145800000
+modulation = "FM"
+baudrate = 0
+framing = "none"
+
+[downlink.image]
+protocol = "sstv"
+"#;
+        let path = write_temp("sstv.toml", toml);
+        let def = match load_satellite(&path) {
+            Ok(def) => def,
+            Err(err) => panic!("sstv toml should load: {err}"),
+        };
+        assert_eq!(def.downlinks.len(), 1);
+        assert!(matches!(def.downlinks[0].image, Some(ImageDef::Sstv {})));
+        assert!(def.downlinks[0].modem.is_none());
+        assert!(def.downlinks[0].framer.is_none());
+        assert!(def.downlinks[0].codec.is_none());
     }
 }

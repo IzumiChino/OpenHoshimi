@@ -11,6 +11,7 @@ members = [
     "tools/decode_file",
     "tools/iq_inspect",
     "tools/cpm_dump",
+    "tools/syncword_scan",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ rfd = "0.14.1"
 rustfft = "6.4"
 rayon = "1.10"
 png = "0.17"
+jpeg-decoder = "0.3"
 
 [profile.release]
 lto = "thin"
