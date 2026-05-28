@@ -57,6 +57,7 @@ fn bit_field(name: &str, group: &str, bit_offset: usize, bit_length: usize) -> T
 fn schema() -> TelemetrySchemaDef {
     TelemetrySchemaDef {
         prefix_skip: 0,
+        match_lengths: vec![],
         discriminator: None,
         variants: vec![],
         fields: vec![
@@ -326,9 +327,15 @@ fn prefix_skip_strips_payload_header() {
 }
 
 #[test]
-fn discriminator_picks_variant_and_falls_back() {
+fn discriminator_strict_whitelist_no_silent_fallback() {
+    // When a discriminator is configured and at least one variant
+    // exists, an unmatched discriminator MUST refuse the frame rather
+    // than silently falling through to the top-level fields. This
+    // mirrors gr-satellites / Kaitai struct behaviour for IO-117 and
+    // similar multi-purpose framings.
     let schema = TelemetrySchemaDef {
         prefix_skip: 2,
+        match_lengths: vec![],
         discriminator: Some(DiscriminatorDef {
             offset: 0,
             length: 2,
@@ -338,11 +345,13 @@ fn discriminator_picks_variant_and_falls_back() {
             TelemetryVariantDef {
                 name: "alpha".into(),
                 match_value: 0x0001,
+                match_values: vec![],
                 fields: vec![field("alpha_v", "alpha", 0, 1, Endian::Big, 1.0, 0.0)],
             },
             TelemetryVariantDef {
                 name: "beta".into(),
                 match_value: 0x0002,
+                match_values: vec![],
                 fields: vec![field("beta_v", "beta", 0, 1, Endian::Big, 1.0, 0.0)],
             },
         ],
@@ -360,8 +369,88 @@ fn discriminator_picks_variant_and_falls_back() {
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].key, "beta_v");
 
-    // discriminator = 0x0099 (no match -> fallback); body byte 0 = 0xFF
+    // discriminator = 0x0099 (no match) -> refused, NOT fallback.
     let fields = parser.parse(&frame_with(vec![0x00, 0x99, 0xFF]));
+    assert!(fields.is_empty());
+}
+
+#[test]
+fn fallback_fields_apply_when_no_variants_configured() {
+    // Backwards-compatible regression check: when the variant list is
+    // empty, the top-level fields still serve as the flat layout, even
+    // if a discriminator happens to be configured.
+    let schema = TelemetrySchemaDef {
+        prefix_skip: 0,
+        match_lengths: vec![],
+        discriminator: None,
+        variants: vec![],
+        fields: vec![field("only", "misc", 0, 1, Endian::Big, 1.0, 0.0)],
+    };
+    let parser = SchemaParser::new(&schema);
+    let fields = parser.parse(&frame_with(vec![0x42]));
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].key, "fallback");
+    assert_eq!(fields[0].key, "only");
+}
+
+#[test]
+fn match_lengths_rejects_off_size_frames() {
+    // Frames whose raw length is not in the whitelist must produce no
+    // fields, even when every other gate would let them through.
+    let schema = TelemetrySchemaDef {
+        prefix_skip: 0,
+        match_lengths: vec![3],
+        discriminator: None,
+        variants: vec![],
+        fields: vec![field("v", "misc", 0, 1, Endian::Big, 1.0, 0.0)],
+    };
+    let parser = SchemaParser::new(&schema);
+
+    // Length matches: field decoded.
+    let fields = parser.parse(&frame_with(vec![0xAA, 0xBB, 0xCC]));
+    assert_eq!(fields.len(), 1);
+
+    // Length too short: refused.
+    let fields = parser.parse(&frame_with(vec![0xAA, 0xBB]));
+    assert!(fields.is_empty());
+
+    // Length too long: refused.
+    let fields = parser.parse(&frame_with(vec![0xAA, 0xBB, 0xCC, 0xDD]));
+    assert!(fields.is_empty());
+}
+
+#[test]
+fn match_values_groups_multiple_ids_into_one_variant() {
+    // A single variant with `match_values` covers several discriminator
+    // values without duplicating the field list. Mirrors IO-117's four
+    // legal `tlm_id` values (13840 / 13841 / 13842 / 30234) all sharing
+    // the same HK layout.
+    let schema = TelemetrySchemaDef {
+        prefix_skip: 2,
+        match_lengths: vec![],
+        discriminator: Some(DiscriminatorDef {
+            offset: 0,
+            length: 2,
+            endian: Endian::Big,
+        }),
+        variants: vec![TelemetryVariantDef {
+            name: "hk".into(),
+            match_value: 0,
+            match_values: vec![13840, 13841, 13842, 30234],
+            fields: vec![field("v", "hk", 0, 1, Endian::Big, 1.0, 0.0)],
+        }],
+        fields: vec![],
+    };
+    let parser = SchemaParser::new(&schema);
+
+    for id in [13840u16, 13841, 13842, 30234] {
+        let mut bytes = id.to_be_bytes().to_vec();
+        bytes.push(0xAB);
+        let fields = parser.parse(&frame_with(bytes));
+        assert_eq!(fields.len(), 1, "id {id} should select hk variant");
+        assert_eq!(fields[0].key, "v");
+    }
+
+    // An id outside the whitelist must be refused.
+    let fields = parser.parse(&frame_with(vec![0x12, 0x34, 0xAB]));
+    assert!(fields.is_empty());
 }

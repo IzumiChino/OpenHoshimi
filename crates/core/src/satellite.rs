@@ -512,6 +512,14 @@ pub struct TelemetrySchemaDef {
     /// evaluated against the unstripped payload.
     #[serde(default)]
     pub prefix_skip: usize,
+    /// Whitelist of frame lengths that this schema applies to. When
+    /// non-empty, the parser returns no fields for any frame whose raw
+    /// length is not in the list - guarding against multi-purpose framing
+    /// where the same codec emits both telemetry and non-telemetry
+    /// payloads (e.g. IO-117's AX.100 link, which carries both 101-byte
+    /// HK packets and store-and-forward digipeater traffic).
+    #[serde(default)]
+    pub match_lengths: Vec<usize>,
     /// Optional discriminator that selects one of [`variants`](Self::variants).
     #[serde(default)]
     pub discriminator: Option<DiscriminatorDef>,
@@ -541,16 +549,30 @@ pub struct DiscriminatorDef {
     pub endian: Endian,
 }
 
-/// One variant inside a [`TelemetrySchemaDef`] keyed by `match_value`.
+/// One variant inside a [`TelemetrySchemaDef`] keyed by discriminator value.
+///
+/// A variant matches when the discriminator value equals
+/// [`match_value`](Self::match_value) **or** appears in
+/// [`match_values`](Self::match_values). Use the list form when several
+/// IDs share the exact same field layout (e.g. IO-117's four legal
+/// `tlm_id` values 13840 / 13841 / 13842 / 30234 all decoding the same
+/// HK block).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryVariantDef {
     /// Short identifier for the variant (e.g. `"b1_obc"`). Surfaced to
     /// the UI to label which variant produced a given decode.
     #[serde(deserialize_with = "required")]
     pub name: String,
-    /// Discriminator value that selects this variant. Compared as a
-    /// `u64` against the value read by [`DiscriminatorDef`].
+    /// Single discriminator value that selects this variant. Defaults to
+    /// `0` and is unused when [`match_values`](Self::match_values) is
+    /// non-empty.
+    #[serde(default)]
     pub match_value: u64,
+    /// List of discriminator values that all select this variant. When
+    /// non-empty, [`match_value`](Self::match_value) is ignored. Useful
+    /// when several IDs share the same field layout.
+    #[serde(default)]
+    pub match_values: Vec<u64>,
     /// Field list applied (against the prefix-stripped payload) when
     /// this variant is selected.
     #[serde(default, rename = "field")]
@@ -822,6 +844,14 @@ fn validate_telemetry_schema(name: &str, schema: &TelemetrySchemaDef) -> Result<
             });
         }
     }
+    for (idx, len) in schema.match_lengths.iter().enumerate() {
+        if *len == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: format!("telemetry.{name}.match_lengths[{idx}]"),
+                reason: "must be > 0".into(),
+            });
+        }
+    }
     if !schema.variants.is_empty() && schema.discriminator.is_none() {
         return Err(ConfigError::InvalidValue {
             field: format!("telemetry.{name}"),
@@ -830,11 +860,18 @@ fn validate_telemetry_schema(name: &str, schema: &TelemetrySchemaDef) -> Result<
     }
     let mut seen = std::collections::HashSet::new();
     for variant in &schema.variants {
-        if !seen.insert(variant.match_value) {
-            return Err(ConfigError::InvalidValue {
-                field: format!("telemetry.{name}.variant[{}].match_value", variant.name),
-                reason: "duplicate match_value".into(),
-            });
+        let candidates: Vec<u64> = if variant.match_values.is_empty() {
+            vec![variant.match_value]
+        } else {
+            variant.match_values.clone()
+        };
+        for value in candidates {
+            if !seen.insert(value) {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("telemetry.{name}.variant[{}]", variant.name),
+                    reason: format!("duplicate discriminator value {value}"),
+                });
+            }
         }
         validate_telemetry_fields(
             &format!("telemetry.{name}.variant[{}]", variant.name),

@@ -109,15 +109,36 @@ mode = "asm_golay"
 
 [telemetry.io117]
 prefix_skip = 4
+# IO-117 multiplexes 101-byte HK telemetry with arbitrary-length
+# store-and-forward digipeater traffic over the same AX.100 framing.
+# Restrict this schema to the documented HK frame size (Kaitai struct
+# `case 101:`). Frames of any other length are not telemetry and must
+# not be decoded with this layout.
+match_lengths = [101]
 
-[[telemetry.io117.field]]
+# tlm_id discriminator at raw offset 4 (immediately after the 4-byte
+# CSP header). The Kaitai struct validates the value is one of
+# 13840 / 13841 / 13842 / 30234; any other value is rejected.
+[telemetry.io117.discriminator]
+offset = 4
+length = 2
+endian = "big"
+
+# Single HK variant covering all four documented `tlm_id` values.
+# `match_values` lets one field list serve every legal id without
+# duplicating the 52-field block four times.
+[[telemetry.io117.variant]]
+name = "hk"
+match_values = [13840, 13841, 13842, 30234]
+
+[[telemetry.io117.variant.field]]
 name = "tlm_id"
 group = "csp"
 offset = 0
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "unix_time_ms"
 group = "time"
 offset = 2
@@ -125,7 +146,7 @@ length = 2
 endian = "big"
 unit = "ms"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "unix_time"
 group = "time"
 offset = 4
@@ -133,48 +154,48 @@ length = 4
 endian = "big"
 unit = "s"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "process_time"
 group = "obc"
 offset = 8
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solar_x_voltage"
 group = "eps"
 offset = 10
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solar_y_voltage"
 group = "eps"
 offset = 12
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solar_x_current"
 group = "eps"
 offset = 14
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solar_y_current"
 group = "eps"
 offset = 16
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "eps_bootcause"
 group = "eps"
 offset = 18
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "mppt_x_temperature"
 group = "temp"
 offset = 19
@@ -184,7 +205,7 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "mppt_y_temperature"
 group = "temp"
 offset = 20
@@ -194,7 +215,7 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "eps_temperature"
 group = "temp"
 offset = 21
@@ -204,7 +225,7 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "battery_1_temperature"
 group = "temp"
 offset = 22
@@ -214,7 +235,7 @@ unit = "C"
 warn_below = -10.0
 warn_above = 45.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "battery_2_temperature"
 group = "temp"
 offset = 23
@@ -224,7 +245,7 @@ unit = "C"
 warn_below = -10.0
 warn_above = 45.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "battery_3_temperature"
 group = "temp"
 offset = 24
@@ -234,34 +255,34 @@ unit = "C"
 warn_below = -10.0
 warn_above = 45.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solar_total_current"
 group = "eps"
 offset = 25
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "system_total_current"
 group = "eps"
 offset = 27
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "battery_voltage"
 group = "eps"
 offset = 29
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "eps_outputs"
 group = "eps"
 offset = 31
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "radio_pa_temperature"
 group = "temp"
 offset = 32
@@ -271,21 +292,21 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "radio_tx_count"
 group = "comms"
 offset = 33
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "radio_rx_count"
 group = "comms"
 offset = 35
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "radio_last_rssi"
 group = "comms"
 offset = 37
@@ -294,59 +315,59 @@ endian = "big"
 signed = true
 unit = "dBm"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "obc_boot_count"
 group = "obc"
 offset = 39
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "radio_boot_count"
 group = "comms"
 offset = 41
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "eps_boot_count"
 group = "eps"
 offset = 43
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "payload_rx_count"
 group = "payload"
 offset = 45
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "payload_tx_count"
 group = "payload"
 offset = 46
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "software_status"
 group = "obc"
 offset = 47
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "heater_status"
 group = "eps"
 offset = 48
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "obc_temperature"
 group = "temp"
 offset = 49
 length = 1
 unit = "C"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gyroscope_x"
 group = "adcs"
 offset = 50
@@ -354,7 +375,7 @@ length = 2
 endian = "big"
 signed = true
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gyroscope_y"
 group = "adcs"
 offset = 52
@@ -362,7 +383,7 @@ length = 2
 endian = "big"
 signed = true
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gyroscope_z"
 group = "adcs"
 offset = 54
@@ -370,7 +391,7 @@ length = 2
 endian = "big"
 signed = true
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "magnetometer_x"
 group = "adcs"
 offset = 56
@@ -378,7 +399,7 @@ length = 2
 endian = "big"
 signed = true
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "magnetometer_y"
 group = "adcs"
 offset = 58
@@ -386,7 +407,7 @@ length = 2
 endian = "big"
 signed = true
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "magnetometer_z"
 group = "adcs"
 offset = 60
@@ -394,7 +415,7 @@ length = 2
 endian = "big"
 signed = true
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solarpanel_plus_x_temperature"
 group = "temp"
 offset = 62
@@ -404,7 +425,7 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solarpanel_plus_y_temperature"
 group = "temp"
 offset = 63
@@ -414,7 +435,7 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solarpanel_minus_x_temperature"
 group = "temp"
 offset = 64
@@ -424,7 +445,7 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "solarpanel_minus_y_temperature"
 group = "temp"
 offset = 65
@@ -434,89 +455,89 @@ unit = "C"
 warn_below = -40.0
 warn_above = 85.0
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "coarse_sun_sensor_plus_x"
 group = "adcs"
 offset = 66
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "coarse_sun_sensor_plus_y"
 group = "adcs"
 offset = 68
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "coarse_sun_sensor_minus_x"
 group = "adcs"
 offset = 70
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "coarse_sun_sensor_minus_y"
 group = "adcs"
 offset = 72
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gps_status_flag"
 group = "gps"
 offset = 74
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gps_fix_time"
 group = "gps"
 offset = 75
 length = 4
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gps_latitude"
 group = "gps"
 offset = 79
 length = 4
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gps_longitude"
 group = "gps"
 offset = 83
 length = 4
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "gps_altitude"
 group = "gps"
 offset = 87
 length = 4
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "sband_tx_count"
 group = "payload"
 offset = 91
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "antenna_status_flag"
 group = "adcs"
 offset = 93
 length = 2
 endian = "big"
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "acs_state_flag"
 group = "adcs"
 offset = 95
 length = 1
 
-[[telemetry.io117.field]]
+[[telemetry.io117.variant.field]]
 name = "acs_parameters_flag"
 group = "adcs"
 offset = 96

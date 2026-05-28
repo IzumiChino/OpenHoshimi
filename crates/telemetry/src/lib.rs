@@ -14,9 +14,23 @@ use openhoshimi_core::{Frame, TelemetryField, TelemetrySchema, TelemetryValue, W
 /// Supports flat schemas (a single field list applied to every frame) and
 /// variant schemas (a discriminator value picks one of several field
 /// lists). See [`TelemetrySchemaDef`] for the layout shapes.
+///
+/// Two safety gates are applied before any field decoding:
+///
+/// * If `match_lengths` is non-empty, the parser returns no fields for
+///   any frame whose raw length is not in the list. This is essential
+///   for satellites whose framing carries non-telemetry payloads
+///   alongside HK telemetry (e.g. IO-117's AX.100 link multiplexes
+///   101-byte HK packets with arbitrary-length store-and-forward
+///   digipeater traffic).
+/// * If a `discriminator` is configured and no variant matches the
+///   discriminator value, the parser returns no fields - even when a
+///   non-empty fallback `fields` list is configured. This mirrors a
+///   strict "tlm_id whitelist" check.
 #[derive(Debug, Clone)]
 pub struct SchemaParser {
     prefix_skip: usize,
+    match_lengths: Vec<usize>,
     discriminator: Option<DiscriminatorDef>,
     variants: Vec<TelemetryVariantDef>,
     fallback_fields: Vec<TelemetryFieldDef>,
@@ -27,6 +41,7 @@ impl SchemaParser {
     pub fn new(schema: &TelemetrySchemaDef) -> Self {
         Self {
             prefix_skip: schema.prefix_skip,
+            match_lengths: schema.match_lengths.clone(),
             discriminator: schema.discriminator.clone(),
             variants: schema.variants.clone(),
             fallback_fields: schema.fields.clone(),
@@ -39,7 +54,12 @@ impl SchemaParser {
     /// slice; field offsets are then evaluated against the slice with
     /// `prefix_skip` bytes removed from the front.
     pub fn parse_bytes(&self, raw: &[u8]) -> Vec<TelemetryField> {
-        let fields = self.select_fields(raw);
+        if !self.match_lengths.is_empty() && !self.match_lengths.contains(&raw.len()) {
+            return Vec::new();
+        }
+        let Some(fields) = self.select_fields(raw) else {
+            return Vec::new();
+        };
         let body = raw.get(self.prefix_skip..).unwrap_or(&[]);
         fields
             .iter()
@@ -47,15 +67,30 @@ impl SchemaParser {
             .collect()
     }
 
-    fn select_fields(&self, raw: &[u8]) -> &[TelemetryFieldDef] {
+    fn select_fields(&self, raw: &[u8]) -> Option<&[TelemetryFieldDef]> {
         if let Some(disc) = &self.discriminator {
-            if let Some(value) = read_discriminator(raw, disc) {
-                if let Some(variant) = self.variants.iter().find(|v| v.match_value == value) {
-                    return &variant.fields;
-                }
+            let value = read_discriminator(raw, disc)?;
+            if let Some(variant) = self.variants.iter().find(|v| variant_matches(v, value)) {
+                return Some(&variant.fields);
+            }
+            // Discriminator configured but no variant matched: refuse
+            // the frame outright (treat the variant list as a strict
+            // whitelist) instead of silently falling back to the flat
+            // field list, which would otherwise misinterpret unrelated
+            // payloads.
+            if !self.variants.is_empty() {
+                return None;
             }
         }
-        &self.fallback_fields
+        Some(&self.fallback_fields)
+    }
+}
+
+fn variant_matches(variant: &TelemetryVariantDef, value: u64) -> bool {
+    if variant.match_values.is_empty() {
+        variant.match_value == value
+    } else {
+        variant.match_values.contains(&value)
     }
 }
 

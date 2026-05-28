@@ -82,6 +82,11 @@ mode = "asm_golay"
 
 [telemetry.lume_1]
 prefix_skip = 30
+# Restrict this schema to the documented HK frame sizes (prefix 30 +
+# variant body 74 / 85 / 92 / 124 / 129 bytes for TTC+GSSB / AOCS /
+# Temps / OBC / EPS). Frames of any other length are not LUME-1 HK
+# telemetry and must not be decoded with this layout.
+match_lengths = [104, 115, 122, 154, 159]
 
 [telemetry.lume_1.discriminator]
 offset = 28
