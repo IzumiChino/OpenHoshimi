@@ -512,7 +512,6 @@ pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct GardnerTracker {
-    nominal_sps: f32,
     period: f32,
     period_avg: f32,
     period_min: f32,
@@ -574,7 +573,6 @@ impl GardnerTracker {
         let beta = (4.0 * omega_n_t * omega_n_t) / (denom * ted_gain);
         let bound = samples_per_symbol * clk_limit;
         Self {
-            nominal_sps: samples_per_symbol,
             period: samples_per_symbol,
             period_avg: samples_per_symbol,
             period_min: samples_per_symbol - bound,
@@ -656,18 +654,6 @@ impl GardnerTracker {
         self.prev_input = sample;
         self.cursor += 1.0;
         emitted
-    }
-
-    /// Current estimate of the symbol period in samples.
-    #[allow(dead_code)]
-    pub(crate) fn period(&self) -> f32 {
-        self.period
-    }
-
-    /// Nominal samples-per-symbol the tracker was built with.
-    #[allow(dead_code)]
-    pub(crate) fn nominal_sps(&self) -> f32 {
-        self.nominal_sps
     }
 }
 

@@ -131,16 +131,15 @@ impl FmAudioDemodulator {
         let dc_len = (samples_per_symbol * 32.0).ceil().max(2.0) as usize;
         let dc_blocker = BoxcarFilter::new(dc_len);
         let agc = RmsAgc::new(samples_per_symbol);
-        // First-order proportional Mueller-Muller. A Gardner TED port
-        // with gr-satellites' default `clk_bw=0.06`, `damping=1.0`,
-        // `ted_gain=1.47`, `clk_limit=0.004` was attempted and regressed
-        // both synthetic tests and real-recording frame counts (0 frames
-        // on satnogs_7633827 vs 65/103 with M&M) -- the gr-sat constants
-        // assume the upstream input has been decimated to sps~10, but
-        // our FmAudioDemodulator runs at the full audio rate (sps=40 at
-        // 1k2/48k), making the period-clamp band tighter than the per-
-        // symbol error-update step. The Gardner code is preserved in
-        // `crate::cpm::GardnerTracker` for future in-the-loop tuning.
+        // First-order proportional Mueller-Muller. Two attempts at a
+        // Gardner TED port (with and without an upstream decimate-by-4
+        // to match gr-satellites' assumed sps~10 regime) both regressed
+        // real-recording frame counts on satnogs_7633827 vs the M&M
+        // baseline (0/103 and 6/103 respectively, vs 65/103). The
+        // GardnerTracker code is preserved in `crate::cpm::GardnerTracker`
+        // for future in-the-loop tuning if a host with gr-satellites is
+        // ever available; until then M&M with gain 0.005 is the empirical
+        // optimum on this OGG.
         let tracker = TrackingInterpolator::new(samples_per_symbol, MM_TIMING_GAIN);
 
         Ok(Self {
