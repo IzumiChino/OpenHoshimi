@@ -133,6 +133,98 @@ impl Ax100Decoder {
             flags,
         })
     }
+
+    /// Decode AX100 ASM+Golay with soft-decision RS erasure marking.
+    ///
+    /// `soft_per_bit` is one f32 per packet bit, MSB-first inside each
+    /// byte (matching `pack_msb_bits`); its length must equal
+    /// `packet.len() * 8`. `erasure_count` is the number of payload
+    /// bytes to mark as erasures, ranked by ascending min |soft|
+    /// across each byte's eight bits.
+    ///
+    /// The soft path is intended as a *fallback* for codewords whose
+    /// hard-decision RS fails. RS(255,223) hard decoding handles up to
+    /// 16 byte errors; with `K` erasures, the joint capacity rises to
+    /// `2*errors + K <= 32`. Mis-marking a clean byte costs one
+    /// erasure slot, so the effective K depends on how reliable the
+    /// soft samples are. Callers should pick K from an off-line sweep
+    /// over representative recordings.
+    pub fn decode_asm_golay_with_soft(
+        &self,
+        packet: &[u8],
+        soft_per_bit: &[f32],
+        erasure_count: usize,
+    ) -> Result<Ax100Frame, DecodeError> {
+        if packet.len() < ASM_GOLAY_HEADER_LEN {
+            return Err(DecodeError::TooShort(packet.len()));
+        }
+        if packet.len() > AX100_ASM_GOLAY_MAX_PDU_LEN {
+            return Err(DecodeError::InvalidEncoding(
+                "AX100 ASM+Golay packet is longer than 258 bytes".to_string(),
+            ));
+        }
+        if soft_per_bit.len() != packet.len() * 8 {
+            return Err(DecodeError::InvalidEncoding(
+                "soft sample length must equal packet bit count".to_string(),
+            ));
+        }
+
+        let header =
+            (u32::from(packet[0]) << 16) | (u32::from(packet[1]) << 8) | u32::from(packet[2]);
+        let decoded_header = golay::decode(header)?;
+        let encoded_len = usize::from(decoded_header.data & 0xff);
+        let flags = Ax100Flags {
+            viterbi: false,
+            scrambler: true,
+            reed_solomon: true,
+            golay_errors: decoded_header.corrected_errors,
+        };
+
+        if encoded_len == 0 {
+            return Err(DecodeError::TooShort(0));
+        }
+        if packet.len() < ASM_GOLAY_HEADER_LEN + encoded_len {
+            return Err(DecodeError::TooShort(packet.len()));
+        }
+        if encoded_len <= reed_solomon::PARITY_LEN {
+            return Err(DecodeError::TooShort(encoded_len));
+        }
+
+        let payload_range = ASM_GOLAY_HEADER_LEN..ASM_GOLAY_HEADER_LEN + encoded_len;
+        let mut payload = packet[payload_range.clone()].to_vec();
+        ccsds_randomizer::xor_sequence(&mut payload);
+
+        // Per-byte confidence: minimum |soft| across the 8 bits
+        // composing each payload byte, in raw-packet bit order. CCSDS
+        // descrambling is XOR, so it does not change which bytes are
+        // reliable.
+        let bit_offset = payload_range.start * 8;
+        let mut byte_confidences: Vec<(usize, f32)> = (0..encoded_len)
+            .map(|i| {
+                let mut min_abs = f32::INFINITY;
+                for j in 0..8 {
+                    let s = soft_per_bit[bit_offset + i * 8 + j].abs();
+                    if s < min_abs {
+                        min_abs = s;
+                    }
+                }
+                (i, min_abs)
+            })
+            .collect();
+        byte_confidences.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let k = erasure_count.min(encoded_len).min(reed_solomon::PARITY_LEN);
+        let erasures: Vec<usize> = byte_confidences[..k].iter().map(|(idx, _)| *idx).collect();
+
+        let decoded = ReedSolomon::new(1).decode_shortened_with_erasures(&payload, &erasures)?;
+
+        Ok(Ax100Frame {
+            mode: Ax100Mode::AsmGolay,
+            payload: decoded.message,
+            corrected_errors: decoded.corrected_errors,
+            flags,
+        })
+    }
 }
 
 /// Decoded AX100 packet.
@@ -246,5 +338,105 @@ mod tests {
 
         assert_eq!(frame.payload, payload);
         assert!(frame.corrected_errors > 0);
+    }
+
+    #[test]
+    fn soft_recovers_packet_beyond_hard_capacity() {
+        // Construct a valid AX.100 ASM+Golay packet (216-byte CSP-style
+        // payload to exercise a near-full RS codeword), then corrupt 24
+        // payload bytes. Hard-decision RS caps at 16 errors, so it must
+        // fail; the soft-decision path with K=24 erasures should
+        // recover the original payload, since 2*0 + 24 <= 32 = nroots.
+        let payload: Vec<u8> = (0..216).map(|i| (i ^ 0xa5) as u8).collect();
+
+        // Encode + scramble
+        let mut encoded_payload = reed_solomon::encode_shortened(&payload, 1);
+        ccsds_randomizer::xor_sequence(&mut encoded_payload);
+        let header = golay::encode(encoded_payload.len() as u16);
+        let mut packet = vec![
+            ((header >> 16) & 0xff) as u8,
+            ((header >> 8) & 0xff) as u8,
+            (header & 0xff) as u8,
+        ];
+        packet.extend_from_slice(&encoded_payload);
+
+        // Corrupt 24 bytes inside the RS codeword region. These will
+        // be the lowest-confidence bytes via the soft samples below.
+        let corruption_positions: Vec<usize> = (0..24).map(|k| 5 + k * 9).collect();
+        for &i in &corruption_positions {
+            let pos = ASM_GOLAY_HEADER_LEN + i;
+            packet[pos] ^= 0xc3;
+        }
+
+        // Build a soft sample vector aligned with packet bits: high
+        // confidence (+/-1.0) everywhere, low confidence (+/-0.05) at
+        // the eight bits of each corrupted byte. The decoder ranks by
+        // ascending min |soft|, so corrupted bytes sort first.
+        let mut soft = vec![0.0f32; packet.len() * 8];
+        for (byte_idx, byte) in packet.iter().enumerate() {
+            for bit_idx in 0..8 {
+                let bit = (byte >> (7 - bit_idx)) & 1;
+                let sign = if bit == 1 { 1.0 } else { -1.0 };
+                soft[byte_idx * 8 + bit_idx] = sign * 1.0;
+            }
+        }
+        for &i in &corruption_positions {
+            let bit_base = (ASM_GOLAY_HEADER_LEN + i) * 8;
+            for j in 0..8 {
+                soft[bit_base + j] = soft[bit_base + j].signum() * 0.05;
+            }
+        }
+
+        let decoder = Ax100Decoder::new();
+
+        // Hard decision must fail: 24 byte errors > 16-error cap.
+        assert!(
+            decoder.decode_asm_golay(&packet).is_err(),
+            "hard decision must fail past 16-error capacity"
+        );
+
+        // Soft decision with K=24 erasures must succeed.
+        let frame = match decoder.decode_asm_golay_with_soft(&packet, &soft, 24) {
+            Ok(f) => f,
+            Err(err) => panic!("soft decision with K=24 must recover: {err}"),
+        };
+        assert_eq!(frame.mode, Ax100Mode::AsmGolay);
+        assert_eq!(frame.payload, payload);
+        assert!(frame.flags.scrambler);
+        assert!(frame.flags.reed_solomon);
+        assert!(frame.corrected_errors >= 24);
+    }
+
+    #[test]
+    fn soft_with_zero_erasures_matches_hard_decision() {
+        // With K=0 and no errors, the soft path must agree with the
+        // hard-decision wrapper bit-for-bit.
+        let payload = b"asm-golay-payload";
+        let mut encoded_payload = reed_solomon::encode_shortened(payload, 1);
+        ccsds_randomizer::xor_sequence(&mut encoded_payload);
+        let header = golay::encode(encoded_payload.len() as u16);
+        let mut packet = vec![
+            ((header >> 16) & 0xff) as u8,
+            ((header >> 8) & 0xff) as u8,
+            (header & 0xff) as u8,
+        ];
+        packet.extend_from_slice(&encoded_payload);
+
+        let mut soft = vec![0.0f32; packet.len() * 8];
+        for (byte_idx, byte) in packet.iter().enumerate() {
+            for bit_idx in 0..8 {
+                let bit = (byte >> (7 - bit_idx)) & 1;
+                let sign = if bit == 1 { 1.0 } else { -1.0 };
+                soft[byte_idx * 8 + bit_idx] = sign;
+            }
+        }
+
+        let decoder = Ax100Decoder::new();
+        let hard = decoder.decode_asm_golay(&packet).expect("hard ok");
+        let soft_frame = decoder
+            .decode_asm_golay_with_soft(&packet, &soft, 0)
+            .expect("soft ok");
+        assert_eq!(hard.payload, soft_frame.payload);
+        assert_eq!(hard.payload, payload);
     }
 }

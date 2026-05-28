@@ -21,6 +21,21 @@ impl ReedSolomon {
     ) -> Result<reed_solomon::RsDecoded, DecodeError> {
         reed_solomon::decode_shortened(data, self.interleave)
     }
+
+    /// Decode a shortened Reed-Solomon block with the given erasure
+    /// positions in codeword coordinates `[0, data.len())`. The decoder
+    /// can correct up to `nroots` symbols when `2*errors + erasures
+    /// <= nroots` (16 for the 32-parity AX.100 code), trading erasure
+    /// knowledge for additional error-correction capacity. The returned
+    /// `corrected_errors` count includes both pre-marked erasures and
+    /// hard errors located by the BM step.
+    pub(crate) fn decode_shortened_with_erasures(
+        &self,
+        data: &[u8],
+        erasures: &[usize],
+    ) -> Result<reed_solomon::RsDecoded, DecodeError> {
+        reed_solomon::decode_shortened_with_erasures(data, self.interleave, erasures)
+    }
 }
 
 impl Fec for ReedSolomon {
@@ -574,6 +589,19 @@ pub(crate) mod reed_solomon {
         codeword: &[u8],
         interleave: usize,
     ) -> Result<RsDecoded, DecodeError> {
+        decode_shortened_with_erasures(codeword, interleave, &[])
+    }
+
+    /// Decode a shortened, interleaved RS codeword with optional erasure
+    /// positions. `erasures` are byte indices in the codeword (range
+    /// `0..codeword.len()`); they identify symbols whose value is treated
+    /// as unknown by the decoder. Combined errors+erasures decoding can
+    /// fix up to `nroots` symbols when `2*errors + erasures <= nroots`.
+    pub(crate) fn decode_shortened_with_erasures(
+        codeword: &[u8],
+        interleave: usize,
+        erasures: &[usize],
+    ) -> Result<RsDecoded, DecodeError> {
         if interleave == 0 || codeword.len() / interleave * interleave != codeword.len() {
             return Err(DecodeError::InvalidEncoding(
                 "invalid Reed-Solomon interleave".to_string(),
@@ -585,9 +613,28 @@ pub(crate) mod reed_solomon {
             return Err(DecodeError::TooShort(codeword.len()));
         }
 
+        for &eras in erasures {
+            if eras >= codeword.len() {
+                return Err(DecodeError::InvalidEncoding(
+                    "Reed-Solomon erasure index out of range".to_string(),
+                ));
+            }
+        }
+
         let pad = NN - rs_nn;
         let mut corrected_errors = 0usize;
         let mut out = vec![0u8; codeword.len() - interleave * PARITY_LEN];
+
+        // Erasure positions are routed to their interleave path, then
+        // shifted into the padded RS(255,223) coordinate system that
+        // `decode_block` expects: position 0 of a path's transmitted
+        // payload sits at index `pad` of its RS block.
+        let mut path_eras: Vec<Vec<usize>> = vec![Vec::new(); interleave];
+        for &eras in erasures {
+            let path = eras % interleave;
+            let pos_in_path = eras / interleave;
+            path_eras[path].push(pad + pos_in_path);
+        }
 
         for path in 0..interleave {
             let mut block = [0u8; NN];
@@ -595,7 +642,7 @@ pub(crate) mod reed_solomon {
                 block[pad + k] = codeword[path + k * interleave];
             }
 
-            corrected_errors += decode_block(&mut block, pad)?;
+            corrected_errors += decode_block(&mut block, pad, &path_eras[path])?;
 
             for k in 0..(rs_nn - PARITY_LEN) {
                 out[path + k * interleave] = block[pad + k];
@@ -633,8 +680,24 @@ pub(crate) mod reed_solomon {
 
     const IPRIM: usize = 116;
 
-    fn decode_block(data: &mut [u8; NN], pad: usize) -> Result<usize, DecodeError> {
+    fn decode_block(
+        data: &mut [u8; NN],
+        pad: usize,
+        eras_pos: &[usize],
+    ) -> Result<usize, DecodeError> {
         let nroots = PARITY_LEN;
+        let no_eras = eras_pos.len();
+
+        if no_eras > nroots {
+            return Err(DecodeError::CrcMismatch);
+        }
+        for &pos in eras_pos {
+            if pos < pad || pos >= NN {
+                return Err(DecodeError::InvalidEncoding(
+                    "Reed-Solomon erasure position out of range".to_string(),
+                ));
+            }
+        }
 
         let mut s_val = [0u8; PARITY_LEN];
         for (i, syn) in s_val.iter_mut().enumerate() {
@@ -655,14 +718,28 @@ pub(crate) mod reed_solomon {
 
         let s: Vec<usize> = s_val.iter().map(|&v| usize::from(index_of(v))).collect();
 
-        // Berlekamp-Massey (lambda and b in value form)
+        // Berlekamp-Massey (lambda and b in value form). Lambda is seeded
+        // with the erasure locator polynomial, so the BM loop only needs
+        // `nroots - no_eras` iterations to find the additional error
+        // locator factors.
         let mut lambda = [0u8; PARITY_LEN + 1];
         lambda[0] = 1;
-        let mut b = [0u8; PARITY_LEN + 1];
-        b[0] = 1;
-        let mut el = 0usize;
+        if no_eras > 0 {
+            lambda[1] = alpha_to(mod_nn((PRIM as usize) * (NN - 1 - eras_pos[0])));
+            for (i, eras) in eras_pos.iter().enumerate().skip(1) {
+                let u = mod_nn((PRIM as usize) * (NN - 1 - eras));
+                for j in (1..=i + 1).rev() {
+                    let tmp_idx = index_of(lambda[j - 1]);
+                    if tmp_idx != NN as u8 {
+                        lambda[j] ^= alpha_to(mod_nn(u + usize::from(tmp_idx)));
+                    }
+                }
+            }
+        }
+        let mut b = lambda;
+        let mut el = no_eras;
 
-        for r in 0..nroots {
+        for r in no_eras..nroots {
             let mut discr = s_val[r];
             for i in 1..=el.min(nroots - 1) {
                 if lambda[i] != 0 && s[r - i] != NN {
@@ -682,8 +759,8 @@ pub(crate) mod reed_solomon {
                     }
                 }
 
-                if 2 * el <= r {
-                    el = r + 1 - el;
+                if 2 * el <= r + no_eras {
+                    el = r + 1 + no_eras - el;
                     let discr_inv = NN - discr_idx;
                     for i in 0..=nroots {
                         b[i] = if lambda[i] != 0 {
@@ -702,7 +779,7 @@ pub(crate) mod reed_solomon {
         }
 
         let deg_lambda = match lambda.iter().rposition(|&v| v != 0) {
-            Some(d) if d > 0 && d <= nroots / 2 => d,
+            Some(d) if d > 0 && 2 * d <= nroots + no_eras => d,
             _ => return Err(DecodeError::CrcMismatch),
         };
 
@@ -885,6 +962,122 @@ pub(crate) mod reed_solomon {
 
             assert_eq!(decoded.message, message);
             assert!(decoded.corrected_errors > 0);
+        }
+
+        #[test]
+        fn shortened_corrects_pure_erasures_at_capacity() {
+            // 16 erasures, 0 errors: 2*0 + 16 = 16 = nroots, decoder must
+            // recover exactly.
+            let message: Vec<u8> = (0..160).collect();
+            let mut encoded = encode_shortened(&message, 1);
+            let mut erasures = Vec::with_capacity(PARITY_LEN / 2);
+            for k in 0..(PARITY_LEN / 2) {
+                let pos = 5 + k * 7;
+                encoded[pos] ^= 0xa5;
+                erasures.push(pos);
+            }
+
+            let decoded = match decode_shortened_with_erasures(&encoded, 1, &erasures) {
+                Ok(d) => d,
+                Err(err) => panic!("pure erasures within capacity must decode: {err}"),
+            };
+            assert_eq!(decoded.message, message);
+        }
+
+        #[test]
+        fn shortened_corrects_errors_plus_erasures_within_capacity() {
+            // 4 errors + 8 erasures: 2*4 + 8 = 16 = nroots, at capacity.
+            let message: Vec<u8> = (0..160).collect();
+            let mut encoded = encode_shortened(&message, 1);
+            let mut erasures = Vec::new();
+            for k in 0..8 {
+                let pos = 7 + k * 5;
+                encoded[pos] ^= 0xc3;
+                erasures.push(pos);
+            }
+            // Hard errors the decoder must locate without prior knowledge.
+            for k in 0..4 {
+                let pos = 80 + k * 11;
+                encoded[pos] ^= 0x5a;
+            }
+
+            let decoded = match decode_shortened_with_erasures(&encoded, 1, &erasures) {
+                Ok(d) => d,
+                Err(err) => panic!("errors+erasures within capacity must decode: {err}"),
+            };
+            assert_eq!(decoded.message, message);
+        }
+
+        #[test]
+        fn shortened_rejects_errors_plus_erasures_over_capacity() {
+            // 21 hard errors + 8 erasures: deg(true error) = 29, but the
+            // generalized capacity bound `2*deg <= nroots + no_eras`
+            // permits at most deg = (32+8)/2 = 20. Decoding must fail
+            // rather than silently produce a different codeword.
+            let message: Vec<u8> = (0..160).collect();
+            let mut encoded = encode_shortened(&message, 1);
+            let mut erasures = Vec::new();
+            for k in 0..8 {
+                let pos = 7 + k * 5;
+                encoded[pos] ^= 0xc3;
+                erasures.push(pos);
+            }
+            for k in 0..21 {
+                let pos = 80 + k * 3;
+                encoded[pos] ^= 0x5a;
+            }
+
+            if let Ok(decoded) = decode_shortened_with_erasures(&encoded, 1, &erasures) {
+                assert_ne!(
+                    decoded.message, message,
+                    "decoder must not silently succeed past capacity"
+                );
+            }
+        }
+
+        #[test]
+        fn shortened_clean_codeword_with_erasures_is_unchanged() {
+            // Marking erasures on an unblemished codeword must not
+            // corrupt the recovered message.
+            let message: Vec<u8> = (0..160).collect();
+            let encoded = encode_shortened(&message, 1);
+            let erasures = vec![3, 47, 99];
+
+            let decoded = match decode_shortened_with_erasures(&encoded, 1, &erasures) {
+                Ok(d) => d,
+                Err(err) => panic!("clean codeword must decode regardless of erasures: {err}"),
+            };
+            assert_eq!(decoded.message, message);
+            assert_eq!(decoded.corrected_errors, 0);
+        }
+
+        #[test]
+        fn shortened_interleaved_corrects_per_path_erasures() {
+            // Interleave 2: each path independently sees its own
+            // 4 errors + 8 erasures, so the joint decode is at capacity
+            // for both blocks simultaneously.
+            let message: Vec<u8> = (0..=255).collect();
+            let mut encoded = encode_shortened(&message, 2);
+            let mut erasures = Vec::new();
+            for path in 0..2usize {
+                for k in 0..8 {
+                    let pos_in_path = 9 + k * 5;
+                    let pos = path + pos_in_path * 2;
+                    encoded[pos] ^= 0xa3;
+                    erasures.push(pos);
+                }
+                for k in 0..4 {
+                    let pos_in_path = 80 + k * 11;
+                    let pos = path + pos_in_path * 2;
+                    encoded[pos] ^= 0xc5;
+                }
+            }
+
+            let decoded = match decode_shortened_with_erasures(&encoded, 2, &erasures) {
+                Ok(d) => d,
+                Err(err) => panic!("interleaved errors+erasures must decode: {err}"),
+            };
+            assert_eq!(decoded.message, message);
         }
     }
 }
