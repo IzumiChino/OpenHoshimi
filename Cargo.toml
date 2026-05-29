@@ -12,6 +12,7 @@ members = [
     "tools/iq_inspect",
     "tools/cpm_dump",
     "tools/syncword_scan",
+    "tools/sat_tool",
 ]
 
 [workspace.package]

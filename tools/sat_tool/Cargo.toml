@@ -1,0 +1,22 @@
+[package]
+name = "sat_tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Satellite TOML generator, validator, and importer for OpenHoshimi"
+
+[[bin]]
+name = "sat_tool"
+path = "src/main.rs"
+
+[dependencies]
+openhoshimi-core = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_yaml = "0.9"
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
