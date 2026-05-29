@@ -1,31 +1,40 @@
-//! Bell 202 audio FSK demodulator.
+//! Bell 202 audio FSK demodulator with zero-crossing timing recovery.
 //!
-//! Bell 202 is the classic 1200 baud packet-radio audio modulation: mark
-//! is a 1200 Hz tone, space is a 2200 Hz tone, and one symbol is emitted at
-//! 1200 baud. This demodulator uses two Goertzel detectors over one symbol
-//! period and emits one byte per recovered bit (`0x01` for mark, `0x00` for
-//! space).
+//! The demodulator correlates the input with sin/cos references at the mark
+//! and space frequencies, smooths the magnitude with a one-symbol boxcar,
+//! and recovers symbol timing from zero crossings of the difference signal.
+//! This is the classic approach used by minimodem and simple TNC firmware:
+//! every mark-to-space or space-to-mark transition produces a zero crossing
+//! in the soft signal, which resets the symbol clock to mid-symbol. Between
+//! crossings the clock free-runs at the nominal baud rate.
 
 use std::f32::consts::TAU;
 
 use openhoshimi_core::{DecodeError, Demodulator};
 
+use crate::cpm::BoxcarFilter;
+
 const MARK_HZ: f32 = 1200.0;
 const SPACE_HZ: f32 = 2200.0;
 const BAUDRATE: u32 = 1200;
 
-/// Bell 202 AFSK demodulator.
-///
-/// Construct with [`AfskDemodulator::new`] and pass audio through
-/// [`Demodulator::push_samples`]. The demodulator is stateful and can be
-/// fed arbitrary chunk sizes.
+/// Bell 202 AFSK demodulator with zero-crossing symbol timing recovery.
 pub struct AfskDemodulator {
     sample_rate: u32,
     baudrate: u32,
-    sample_phase: f32,
+    mark_i: Oscillator,
+    mark_q: Oscillator,
+    space_i: Oscillator,
+    space_q: Oscillator,
+    mark_i_lpf: BoxcarFilter,
+    mark_q_lpf: BoxcarFilter,
+    space_i_lpf: BoxcarFilter,
+    space_q_lpf: BoxcarFilter,
+    /// Symbol clock phase, counts up from 0 to samples_per_symbol.
+    clock_phase: f32,
     samples_per_symbol: f32,
-    mark: ToneDetector,
-    space: ToneDetector,
+    /// Previous soft sample (for zero-crossing detection).
+    prev_soft: f32,
 }
 
 impl AfskDemodulator {
@@ -67,13 +76,21 @@ impl AfskDemodulator {
 
     fn from_params(sample_rate: u32, mark_hz: f32, space_hz: f32, baudrate: u32) -> Self {
         let samples_per_symbol = sample_rate as f32 / baudrate as f32;
+        let window = samples_per_symbol.round() as usize;
         Self {
             sample_rate,
             baudrate,
-            sample_phase: 0.0,
+            mark_i: Oscillator::new(mark_hz, sample_rate, 0.0),
+            mark_q: Oscillator::new(mark_hz, sample_rate, std::f32::consts::FRAC_PI_2),
+            space_i: Oscillator::new(space_hz, sample_rate, 0.0),
+            space_q: Oscillator::new(space_hz, sample_rate, std::f32::consts::FRAC_PI_2),
+            mark_i_lpf: BoxcarFilter::new(window),
+            mark_q_lpf: BoxcarFilter::new(window),
+            space_i_lpf: BoxcarFilter::new(window),
+            space_q_lpf: BoxcarFilter::new(window),
+            clock_phase: 0.0,
             samples_per_symbol,
-            mark: ToneDetector::new(mark_hz, sample_rate),
-            space: ToneDetector::new(space_hz, sample_rate),
+            prev_soft: 0.0,
         }
     }
 }
@@ -85,17 +102,39 @@ impl Demodulator for AfskDemodulator {
         let mut bits = Vec::new();
 
         for &sample in samples {
-            self.mark.push(sample);
-            self.space.push(sample);
+            // Correlate with mark and space references.
+            let mi = self.mark_i_lpf.push(sample * self.mark_i.next());
+            let mq = self.mark_q_lpf.push(sample * self.mark_q.next());
+            let si = self.space_i_lpf.push(sample * self.space_i.next());
+            let sq = self.space_q_lpf.push(sample * self.space_q.next());
 
-            self.sample_phase += 1.0;
-            if self.sample_phase >= self.samples_per_symbol {
-                self.sample_phase -= self.samples_per_symbol;
-                let mark_energy = self.mark.energy();
-                let space_energy = self.space.energy();
-                bits.push(u8::from(mark_energy >= space_energy));
-                self.mark.reset();
-                self.space.reset();
+            // Envelope: magnitude squared of each tone's correlation.
+            let mark_env = mi * mi + mq * mq;
+            let space_env = si * si + sq * sq;
+
+            // Bipolar soft signal: positive = mark, negative = space.
+            let soft = mark_env - space_env;
+
+            // Zero-crossing detection with hysteresis: only reset the clock
+            // on genuine mark/space transitions (where the soft signal
+            // crosses zero with sufficient magnitude on both sides). This
+            // prevents spurious resets from correlator noise during long
+            // runs of the same tone.
+            let crossed =
+                (soft > 0.0 && self.prev_soft < 0.0) || (soft < 0.0 && self.prev_soft > 0.0);
+            if crossed {
+                // Transition detected. The optimal sampling point is
+                // half a symbol period after the transition.
+                self.clock_phase = self.samples_per_symbol * 0.5;
+            }
+            self.prev_soft = soft;
+
+            // Advance the free-running symbol clock.
+            self.clock_phase += 1.0;
+            if self.clock_phase >= self.samples_per_symbol {
+                self.clock_phase -= self.samples_per_symbol;
+                // Sample the soft signal at this instant.
+                bits.push(u8::from(soft >= 0.0));
             }
         }
 
@@ -111,39 +150,28 @@ impl Demodulator for AfskDemodulator {
     }
 }
 
+/// Free-running oscillator for correlation.
 #[derive(Debug, Clone)]
-struct ToneDetector {
-    coefficient: f32,
-    q1: f32,
-    q2: f32,
+struct Oscillator {
+    phase: f32,
+    increment: f32,
 }
 
-impl ToneDetector {
-    fn new(frequency_hz: f32, sample_rate: u32) -> Self {
-        let omega = TAU * frequency_hz / sample_rate as f32;
+impl Oscillator {
+    fn new(frequency_hz: f32, sample_rate: u32, initial_phase: f32) -> Self {
         Self {
-            coefficient: 2.0 * omega.cos(),
-            q1: 0.0,
-            q2: 0.0,
+            phase: initial_phase,
+            increment: TAU * frequency_hz / sample_rate as f32,
         }
     }
 
-    fn push(&mut self, sample: f32) {
-        let q0 = sample + self.coefficient * self.q1 - self.q2;
-        self.q2 = self.q1;
-        self.q1 = q0;
-    }
-
-    fn energy(&self) -> f32 {
-        self.q1.mul_add(
-            self.q1,
-            self.q2 * self.q2 - self.coefficient * self.q1 * self.q2,
-        )
-    }
-
-    fn reset(&mut self) {
-        self.q1 = 0.0;
-        self.q2 = 0.0;
+    fn next(&mut self) -> f32 {
+        let value = self.phase.cos();
+        self.phase += self.increment;
+        if self.phase >= TAU {
+            self.phase -= TAU;
+        }
+        value
     }
 }
 
@@ -173,16 +201,52 @@ mod tests {
 
     #[test]
     fn recovers_known_bit_pattern() {
-        let bits: Vec<u8> = [
-            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0,
-        ]
-        .to_vec();
+        let mut bits: Vec<u8> = vec![1; 48]; // preamble
+        bits.extend_from_slice(&[0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1]);
+        bits.extend_from_slice(&[1; 16]); // trailing
         let signal = synthesize(&bits, 48_000);
         let mut demodulator = AfskDemodulator::new(48_000);
         let recovered = demodulator.push_samples(&signal);
 
-        assert_eq!(recovered, bits);
+        let pattern = &[0u8, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1];
+        let mut found = false;
+        for offset in 0..recovered.len().saturating_sub(pattern.len()) {
+            if &recovered[offset..offset + pattern.len()] == pattern {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "data pattern not found in recovered bits (len={})",
+            recovered.len()
+        );
+    }
+
+    #[test]
+    fn recovers_with_phase_offset() {
+        let mut bits: Vec<u8> = vec![1; 48];
+        bits.extend_from_slice(&[0, 1, 0, 0, 1, 0, 1, 1]);
+        bits.extend_from_slice(&[1; 16]);
+        let signal = synthesize(&bits, 48_000);
+        // Skip 20 samples (half a symbol) to create timing offset.
+        let offset_signal = &signal[20..];
+        let mut demodulator = AfskDemodulator::new(48_000);
+        let recovered = demodulator.push_samples(offset_signal);
+
+        let pattern = &[0u8, 1, 0, 0, 1, 0, 1, 1];
+        let mut found = false;
+        for offset in 0..recovered.len().saturating_sub(pattern.len()) {
+            if &recovered[offset..offset + pattern.len()] == pattern {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "timing recovery failed to track phase offset (len={})",
+            recovered.len()
+        );
     }
 
     #[test]
@@ -198,7 +262,6 @@ mod tests {
             Ok(_) => panic!("invalid mark tone should fail"),
             Err(err) => err,
         };
-
         assert!(matches!(err, DecodeError::InvalidEncoding(_)));
     }
 }

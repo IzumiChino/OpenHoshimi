@@ -25,10 +25,10 @@ pub mod sstv;
 pub use ao40::{ao40_syncword_bits, Ao40FecDecoder, Ao40FecEncoder, Ao40Frame};
 pub use ax100::{ax100_syncword, Ax100Decoder, Ax100Flags, Ax100Frame, Ax100Mode};
 pub use ax25::{Ax25Decoder, Ax25Frame, Callsign};
-pub use cw::{CwAnalyzer, CwAnalyzerConfig, DEFAULT_CW_TONE_HZ, DEFAULT_ENVELOPE_RATE_HZ};
 pub use ccsds_concat::{
     CcsdsConcatDecoder, CcsdsConcatFrame, RsBasis, CCSDS_ASM, CCSDS_CONCAT_CODED_BITS,
 };
+pub use cw::{CwAnalyzer, CwAnalyzerConfig, DEFAULT_CW_TONE_HZ, DEFAULT_ENVELOPE_RATE_HZ};
 pub use fec::{ReedSolomon, Viterbi};
 pub use geoscan::{
     GeoscanDecoder, GeoscanFrame, GEOSCAN_CRC_LEN, GEOSCAN_FRAME_LEN, GEOSCAN_PAYLOAD_LEN,
