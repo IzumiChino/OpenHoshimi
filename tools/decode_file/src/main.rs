@@ -597,7 +597,13 @@ fn print_decoded_frame(
             println!("      payload: {}", format_hex(&payload));
             let ascii: String = payload
                 .iter()
-                .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect();
             println!("      ascii:   {ascii}");
             // Only surface telemetry for frames whose integrity is
