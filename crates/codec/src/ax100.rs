@@ -18,6 +18,18 @@ const AX100_RS_MAX_PDU_LEN: usize = RS_LEN + RS_HEADER_LEN;
 const AX100_ASM_GOLAY_MAX_PDU_LEN: usize = RS_LEN + ASM_GOLAY_HEADER_LEN;
 const AX100_SYNCWORD: u32 = 0x930b_51de;
 
+/// Number of least-reliable CRC-covered bits considered by the CRC-aided
+/// Chase search ([`Ax100Decoder::decode_asm_golay_crc_chase`]). Errors
+/// concentrate in low-confidence bits, so a modest window captures the
+/// realistic few-bit-error case while bounding the search.
+const CHASE_CANDIDATE_BITS: usize = 24;
+
+/// Maximum number of bits flipped together in the Chase search. Covers up to
+/// this many residual bit errors among the weakest [`CHASE_CANDIDATE_BITS`]
+/// bits; heavier corruption is not recoverable and the frame stays dropped.
+/// Total trials per frame are sum_{w=1..=N} C(CHASE_CANDIDATE_BITS, w).
+const MAX_CHASE_FLIPS: usize = 4;
+
 /// Decoder for GOMspace NanoCom AX100 packets.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Ax100Decoder;
@@ -213,6 +225,119 @@ impl Ax100Decoder {
             crc_ok: Some(crc_ok),
             flags,
         })
+    }
+
+    /// CRC-aided soft-decision correction for an AX100 ASM+Golay+CRC packet
+    /// that structurally decodes but fails its CRC-32C.
+    ///
+    /// The IO-117 / GreenCube payload carries no forward error correction, so
+    /// residual demod bit errors cannot be corrected algebraically - a failed
+    /// frame can only be dropped. This routine instead treats the CRC-32C as a
+    /// near-perfect (~2^-32 false-accept) validity oracle: it ranks the
+    /// CRC-covered payload bits by ascending soft confidence (`|soft|`),
+    /// then flips small subsets of the least-reliable bits (an ordered Chase /
+    /// list-decoding search, weight 1..=[`MAX_CHASE_FLIPS`] over the
+    /// [`CHASE_CANDIDATE_BITS`] weakest bits) and re-runs the hard decoder on
+    /// each candidate. The first candidate whose CRC-32C passes is returned.
+    ///
+    /// `soft_per_bit` is one f32 per packet bit, MSB-first inside each byte
+    /// (matching `pack_msb_bits`); its length must equal `packet.len() * 8`.
+    /// Only the CRC-covered region (the CSP body plus the 4-byte CRC trailer)
+    /// is searched; the Golay-protected header and the ignored 32-byte RS
+    /// parity block are left untouched.
+    ///
+    /// Returns `Ok(Some(frame))` for a rescued CRC-valid frame, `Ok(None)` if
+    /// no small flip pattern satisfies the CRC (or the soft data is unusable),
+    /// and `Err` only for a structurally invalid packet length.
+    pub fn decode_asm_golay_crc_chase(
+        &self,
+        packet: &[u8],
+        soft_per_bit: &[f32],
+    ) -> Result<Option<Ax100Frame>, DecodeError> {
+        if packet.len() < ASM_GOLAY_HEADER_LEN
+            || soft_per_bit.len() != packet.len().saturating_mul(8)
+        {
+            return Ok(None);
+        }
+
+        // Locate the CRC-covered region from the Golay-decoded length. If the
+        // header itself is uncorrectable there is no reliable region to search.
+        let header =
+            (u32::from(packet[0]) << 16) | (u32::from(packet[1]) << 8) | u32::from(packet[2]);
+        let Ok(decoded_header) = golay::decode(header) else {
+            return Ok(None);
+        };
+        let encoded_len = usize::from(decoded_header.data & 0xff);
+        if encoded_len <= reed_solomon::PARITY_LEN + CRC32_LEN
+            || packet.len() < ASM_GOLAY_HEADER_LEN + encoded_len
+        {
+            return Ok(None);
+        }
+        let body_len = encoded_len - reed_solomon::PARITY_LEN - CRC32_LEN;
+
+        // Candidate bits: the CSP body plus the 4-byte CRC trailer, in wire
+        // (still-scrambled) order. Descrambling is a bijective XOR, so flipping
+        // a wire bit flips the same descrambled-payload bit; searching the wire
+        // bytes and re-decoding is equivalent to searching the payload.
+        let region_start_bit = ASM_GOLAY_HEADER_LEN * 8;
+        let region_end_bit = (ASM_GOLAY_HEADER_LEN + body_len + CRC32_LEN) * 8;
+        let mut ranked: Vec<usize> = (region_start_bit..region_end_bit).collect();
+        ranked.sort_by(|&a, &b| {
+            soft_per_bit[a]
+                .abs()
+                .partial_cmp(&soft_per_bit[b].abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let take = ranked.len().min(CHASE_CANDIDATE_BITS);
+        let candidates = &ranked[..take];
+
+        let mut scratch = packet.to_vec();
+        let mut chosen: Vec<usize> = Vec::with_capacity(MAX_CHASE_FLIPS);
+        let max_flips = MAX_CHASE_FLIPS.min(candidates.len());
+        for weight in 1..=max_flips {
+            if let Some(frame) =
+                self.chase_combinations(packet, &mut scratch, candidates, weight, 0, &mut chosen)
+            {
+                return Ok(Some(frame));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Recursive Chase search helper: try every `weight`-bit flip combination
+    /// drawn from `candidates[start..]`, applying it to `scratch` (a clone of
+    /// `base`), re-running the hard decoder, and returning the first candidate
+    /// whose CRC-32C passes. `chosen` is scratch storage for the current
+    /// combination. Short-circuits on the first success.
+    fn chase_combinations(
+        &self,
+        base: &[u8],
+        scratch: &mut [u8],
+        candidates: &[usize],
+        weight: usize,
+        start: usize,
+        chosen: &mut Vec<usize>,
+    ) -> Option<Ax100Frame> {
+        if chosen.len() == weight {
+            scratch.copy_from_slice(base);
+            for &bit in chosen.iter() {
+                scratch[bit >> 3] ^= 1 << (7 - (bit & 7));
+            }
+            return match self.decode_asm_golay_crc(scratch) {
+                Ok(frame) if frame.crc_ok == Some(true) => Some(frame),
+                _ => None,
+            };
+        }
+        for i in start..candidates.len() {
+            chosen.push(candidates[i]);
+            if let Some(frame) =
+                self.chase_combinations(base, scratch, candidates, weight, i + 1, chosen)
+            {
+                return Some(frame);
+            }
+            chosen.pop();
+        }
+        None
     }
 
     /// Decode AX100 ASM+Golay with soft-decision RS erasure marking.
@@ -414,6 +539,78 @@ mod tests {
             .decode_asm_golay_crc(&packet)
             .expect("packet still parses structurally");
         assert_eq!(frame.crc_ok, Some(false));
+    }
+
+    #[test]
+    fn chase_recovers_low_confidence_bit_errors() {
+        let csp_frame = b"\x82\x97\x64\x00\x1d\x03R7LP>CQ, GreenCube, STORE=0 KN96";
+        let packet = build_crc_packet(csp_frame);
+        let mut corrupted = packet.clone();
+        // Flip three bits in the CRC-covered message region (after the
+        // 3-byte Golay header).
+        let flip_bits = [3 * 8 + 2, 5 * 8 + 7, 12 * 8 + 1];
+        for &bit in &flip_bits {
+            corrupted[bit >> 3] ^= 1 << (7 - (bit & 7));
+        }
+        // High confidence everywhere except the three flipped bits, which are
+        // the least reliable - so the Chase candidate window contains them.
+        let mut soft = vec![8.0f32; corrupted.len() * 8];
+        for &bit in &flip_bits {
+            soft[bit] = 0.05;
+        }
+
+        let decoder = Ax100Decoder::new();
+        let hard = decoder
+            .decode_asm_golay_crc(&corrupted)
+            .expect("structurally valid");
+        assert_eq!(hard.crc_ok, Some(false), "corruption must fail hard CRC");
+
+        let rescued = decoder
+            .decode_asm_golay_crc_chase(&corrupted, &soft)
+            .expect("chase call succeeds")
+            .expect("chase recovers a three-bit error in the weakest bits");
+        assert_eq!(rescued.crc_ok, Some(true));
+        assert_eq!(rescued.payload, csp_frame);
+    }
+
+    #[test]
+    fn chase_gives_up_on_heavy_corruption() {
+        let csp_frame = b"\x82\x97\x64\x00\x1d\x03R7LP>CQ, GreenCube, STORE=0 KN96";
+        let packet = build_crc_packet(csp_frame);
+        let mut corrupted = packet.clone();
+        // Eight bit errors exceed the Chase flip budget, so it must give up
+        // rather than fabricate a frame.
+        for k in 0..8 {
+            let bit = (3 + k) * 8 + 1;
+            corrupted[bit >> 3] ^= 1 << (7 - (bit & 7));
+        }
+        let soft = vec![1.0f32; corrupted.len() * 8];
+
+        let decoder = Ax100Decoder::new();
+        assert_eq!(
+            decoder
+                .decode_asm_golay_crc(&corrupted)
+                .expect("structurally valid")
+                .crc_ok,
+            Some(false)
+        );
+        assert!(decoder
+            .decode_asm_golay_crc_chase(&corrupted, &soft)
+            .expect("chase call succeeds")
+            .is_none());
+    }
+
+    #[test]
+    fn chase_rejects_mismatched_soft_length() {
+        let csp_frame = b"\x82\x97\x64\x00\x1d\x03R7LP>CQ, GreenCube, STORE=0 KN96";
+        let packet = build_crc_packet(csp_frame);
+        let decoder = Ax100Decoder::new();
+        // Soft buffer not 8x the packet length -> no Chase, returns None.
+        let soft = vec![1.0f32; packet.len() * 8 - 1];
+        assert!(decoder
+            .decode_asm_golay_crc_chase(&packet, &soft)
+            .expect("chase call succeeds")
+            .is_none());
     }
 
     #[test]

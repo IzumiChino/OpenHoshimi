@@ -37,12 +37,15 @@ const SAMPLE_BUFFER: usize = 32_768;
 // (large OGG); the test is gated on OPENHOSHIMI_SATNOGS_RECORDINGS and
 // skips when the file or the env flag is absent.
 const RECORDING: &str = "satnogs_7633827_2023-05-28T11-11-08.ogg";
-// Lower bound on CRC-32C-valid frames. With the 64-symbol DC blocker the
-// honest CRC sweep recovers ~24 over the high-elevation pass (up from ~18
-// at the default 32-symbol blocker); 20 leaves headroom for small demod
-// tweaks while still catching a framing / descrambler / CRC / DC-blocker
-// regression.
-const MIN_CRC_VALID: usize = 20;
+// Lower bound on CRC-32C-valid frames. The IO-117 payload has no FEC, so a
+// frame with residual demod bit errors fails CRC and would normally be
+// dropped; the CRC-aided soft-decision Chase in the AX.100 codec recovers
+// frames that fail by a few low-confidence bits (CRC-32C is the ~2^-32
+// false-accept oracle). On the high-elevation pass this lifts the honest
+// CRC count to ~40 (from ~24 hard-decision only, ~18 at the 32-symbol DC
+// blocker). 34 leaves headroom for run-to-run demod variation while still
+// catching a framing / descrambler / CRC / Chase regression.
+const MIN_CRC_VALID: usize = 34;
 
 fn io117_1k2_downlink() -> DownlinkDef {
     DownlinkDef {
