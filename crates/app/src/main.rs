@@ -3601,6 +3601,14 @@ where
     let mut kind = FrameKind::Raw;
     let mut fields = Vec::new();
 
+    let raw = match &decoded {
+        DecodedFrame::Ax25(ax25) => ax25.info.clone(),
+        DecodedFrame::Ao40 { payload, .. } | DecodedFrame::Ax100 { payload, .. } => payload.clone(),
+        DecodedFrame::Geoscan(geoscan) => geoscan.payload.clone(),
+        DecodedFrame::Ssdv(packet) => packet.raw.clone(),
+        DecodedFrame::Raw { .. } => frame.raw.clone(),
+    };
+
     match decoded {
         DecodedFrame::Ax25(ax25) => {
             source = ax25.source.call.clone();
@@ -3620,11 +3628,26 @@ where
                 fields = parser.parse_bytes(&ax25.info);
             }
         }
-        DecodedFrame::Ao40 { payload, .. } | DecodedFrame::Ax100 { payload, .. } => {
+        DecodedFrame::Ao40 { payload, .. } => {
             if let Some(parser) = telemetry {
                 fields = parser.parse_bytes(&payload);
             }
             kind = FrameKind::Tlm;
+        }
+        DecodedFrame::Ax100 {
+            payload, crc_ok, ..
+        } => {
+            // CRC status is surfaced via colour (Err row tint), not TYPE.
+            // Even CRC-failed frames are structurally decoded (Golay header
+            // + CCSDS descramble succeeded) and carry readable content
+            // (digipeater ASCII, partial telemetry). Marking them ERR hides
+            // useful data; keep them TLM so the user sees the payload.
+            kind = FrameKind::Tlm;
+            if crc_ok != Some(false) {
+                if let Some(parser) = telemetry {
+                    fields = parser.parse_bytes(&payload);
+                }
+            }
         }
         DecodedFrame::Geoscan(geoscan) => {
             source = "GEOSCAN".to_string();
@@ -3666,7 +3689,7 @@ where
         destination,
         kind,
         rssi_dbm: frame.rssi_dbm,
-        raw: frame.raw.clone(),
+        raw,
         telemetry: fields,
     })
 }
