@@ -924,6 +924,19 @@ pub(crate) mod reed_solomon {
             }
         }
 
+        // Sanity check: with `no_eras` pre-marked erasures the BM step
+        // finds additional error locations. The joint capacity is
+        // 2*errors + erasures <= nroots, so the maximum total count
+        // (erasures + errors) is (nroots + no_eras) / 2. A count
+        // exceeding this means the BM algorithm converged on a spurious
+        // solution (the input is not a valid codeword within correction
+        // range) and the "corrected" data is garbage. Reject rather than
+        // return false positives.
+        let max_count = (nroots + no_eras) / 2;
+        if count > max_count {
+            return Err(DecodeError::CrcMismatch);
+        }
+
         Ok(count)
     }
 

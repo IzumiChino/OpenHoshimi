@@ -1552,6 +1552,19 @@ impl CodecStage {
                     }
                     (Err(err), _, _) => Err(err),
                 };
+                // RS(255,223) sanity gate: if the decoder reports correcting
+                // the maximum number of symbols (nroots=32), the result is
+                // almost certainly a false positive on non-RS data. Reject
+                // rather than surface garbage payloads.
+                let frame_result = match frame_result {
+                    Ok(ref f)
+                        if *mode == Ax100Mode::AsmGolay
+                            && f.corrected_errors >= 32 =>
+                    {
+                        Err(DecodeError::CrcMismatch)
+                    }
+                    other => other,
+                };
                 let frame = frame_result.map_err(|err| format!("AX100 decode failed: {err}"))?;
                 Ok(DecodedFrame::Ax100 {
                     mode: frame.mode,
