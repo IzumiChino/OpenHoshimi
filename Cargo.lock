@@ -899,7 +899,11 @@ dependencies = [
 
 [[package]]
 name = "cpm_dump"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "clap",
  "crc",
@@ -996,7 +1000,11 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decode_file"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "clap",
  "openhoshimi-codec",
@@ -1870,7 +1878,11 @@ dependencies = [
 
 [[package]]
 name = "iq_inspect"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -2699,7 +2711,11 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openhoshimi-app"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2717,7 +2733,11 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-codec"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2726,7 +2746,11 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-core"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2735,7 +2759,11 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-dsp"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2743,7 +2771,11 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-io"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "cpal",
  "lewton",
@@ -2753,7 +2785,11 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-runtime"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "crc",
  "openhoshimi-codec",
@@ -2766,7 +2802,11 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-telemetry"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "openhoshimi-core",
 ]
@@ -3291,6 +3331,22 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
+=======
+name = "sat_tool"
+version = "1.4.5"
+dependencies = [
+ "clap",
+ "openhoshimi-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "toml",
+ "ureq",
+]
+
+[[package]]
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3606,7 +3662,11 @@ dependencies = [
 
 [[package]]
 name = "syncword_scan"
+<<<<<<< HEAD
 version = "1.4.0"
+=======
+version = "1.4.5"
+>>>>>>> 2bde0e4 (release: bump workspace version to v1.4.5)
 dependencies = [
  "clap",
  "openhoshimi-core",
