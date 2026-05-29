@@ -31,7 +31,8 @@ pub struct CcsdsConcatDecoder {
     /// Apply differential decoding after Viterbi (resolves BPSK 180 deg
     /// phase ambiguity).
     differential: bool,
-    /// Reed-Solomon basis.
+    /// Reed-Solomon basis (reserved for future dual-basis support).
+    #[allow(dead_code)]
     rs_basis: RsBasis,
 }
 
@@ -148,6 +149,7 @@ fn differential_decode(bits: &[u8]) -> Vec<u8> {
 }
 
 /// Differential encode (for test roundtrip): output[i] = output[i-1] XOR input[i].
+#[cfg(test)]
 fn differential_encode(bits: &[u8]) -> Vec<u8> {
     if bits.is_empty() {
         return Vec::new();
