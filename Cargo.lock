@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "cpm_dump"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "clap",
  "crc",
@@ -996,7 +996,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decode_file"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "clap",
  "openhoshimi-codec",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "iq_inspect"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -2699,7 +2699,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openhoshimi-app"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-codec"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-core"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2735,7 +2735,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-dsp"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-io"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "cpal",
  "lewton",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-runtime"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "crc",
  "openhoshimi-codec",
@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-telemetry"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "openhoshimi-core",
 ]
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "syncword_scan"
-version = "0.1.0"
+version = "1.4.0"
 dependencies = [
  "clap",
  "openhoshimi-core",
