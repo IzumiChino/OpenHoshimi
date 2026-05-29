@@ -7,7 +7,9 @@
 
 use openhoshimi_core::DecodeError;
 
-use crate::fec::{ccsds_randomizer, golay, reed_solomon, ReedSolomon};
+use crate::fec::{ccsds_randomizer, crc32c, golay, reed_solomon, ReedSolomon};
+
+const CRC32_LEN: usize = 4;
 
 const RS_LEN: usize = 255;
 const RS_HEADER_LEN: usize = 1;
@@ -59,6 +61,7 @@ impl Ax100Decoder {
             mode: Ax100Mode::ReedSolomon,
             payload: decoded.message[..payload_len].to_vec(),
             corrected_errors: decoded.corrected_errors,
+            crc_ok: None,
             flags: Ax100Flags::default(),
         })
     }
@@ -130,6 +133,84 @@ impl Ax100Decoder {
             mode: Ax100Mode::AsmGolay,
             payload,
             corrected_errors,
+            crc_ok: None,
+            flags,
+        })
+    }
+
+    /// Decode AX100 ASM+Golay as used by the GreenCube / IO-117 digipeater.
+    ///
+    /// The three-byte Golay(24,12) header's low eight bits give the encoded
+    /// length. Measured over on-air captures, this length always counts the
+    /// systematic message plus a 32-byte trailing block (the RS(255,223)
+    /// parity size). The whole field is CCSDS-randomized; after descrambling
+    /// the message bytes appear first, ahead of the 32 trailing bytes. The
+    /// message itself is a CSP frame followed by a 4-byte big-endian CRC-32C
+    /// (libcsp Castagnoli) computed over the CSP frame.
+    ///
+    /// This decoder does not run forward error correction. The 32 trailing
+    /// bytes were checked against a standard CCSDS RS(255,223) codeword in
+    /// conventional and dual-basis representations across the common GF(256)
+    /// primitive polynomials and did not validate, so they are not decoded
+    /// here; integrity rests on the CRC-32C. The decoder strips the 32
+    /// trailing bytes, splits off the CRC-32C, and reports the check in
+    /// `crc_ok`. Clean bursts decode bit-exact; bursts with residual demod
+    /// bit errors fail the CRC and must be discarded rather than
+    /// interpreted. The returned `payload` is the CSP frame with the CRC
+    /// trailer removed.
+    pub fn decode_asm_golay_crc(&self, packet: &[u8]) -> Result<Ax100Frame, DecodeError> {
+        if packet.len() < ASM_GOLAY_HEADER_LEN {
+            return Err(DecodeError::TooShort(packet.len()));
+        }
+        if packet.len() > AX100_ASM_GOLAY_MAX_PDU_LEN {
+            return Err(DecodeError::InvalidEncoding(
+                "AX100 ASM+Golay packet is longer than 258 bytes".to_string(),
+            ));
+        }
+
+        let header =
+            (u32::from(packet[0]) << 16) | (u32::from(packet[1]) << 8) | u32::from(packet[2]);
+        let decoded_header = golay::decode(header)?;
+        let encoded_len = usize::from(decoded_header.data & 0xff);
+        let flags = Ax100Flags {
+            viterbi: false,
+            scrambler: true,
+            reed_solomon: false,
+            golay_errors: decoded_header.corrected_errors,
+        };
+
+        // The encoded length spans the systematic message and the 32 RS
+        // parity bytes; the message must still hold at least the CRC-32C
+        // trailer plus one CSP byte.
+        if encoded_len <= reed_solomon::PARITY_LEN + CRC32_LEN {
+            return Err(DecodeError::TooShort(encoded_len));
+        }
+        if packet.len() < ASM_GOLAY_HEADER_LEN + encoded_len {
+            return Err(DecodeError::TooShort(packet.len()));
+        }
+
+        let mut payload = packet[ASM_GOLAY_HEADER_LEN..ASM_GOLAY_HEADER_LEN + encoded_len].to_vec();
+        ccsds_randomizer::xor_sequence(&mut payload);
+
+        let body_len = encoded_len - reed_solomon::PARITY_LEN - CRC32_LEN;
+        let crc_pos = body_len;
+        let expected = u32::from_be_bytes([
+            payload[crc_pos],
+            payload[crc_pos + 1],
+            payload[crc_pos + 2],
+            payload[crc_pos + 3],
+        ]);
+        let crc_ok = crc32c::checksum(&payload[..body_len]) == expected;
+
+        // Drop the 32 trailing parity bytes and the CRC trailer; the
+        // systematic message (CSP frame) precedes them.
+        payload.truncate(body_len);
+
+        Ok(Ax100Frame {
+            mode: Ax100Mode::AsmGolayCrc,
+            payload,
+            corrected_errors: 0,
+            crc_ok: Some(crc_ok),
             flags,
         })
     }
@@ -222,6 +303,7 @@ impl Ax100Decoder {
             mode: Ax100Mode::AsmGolay,
             payload: decoded.message,
             corrected_errors: decoded.corrected_errors,
+            crc_ok: None,
             flags,
         })
     }
@@ -239,6 +321,10 @@ pub struct Ax100Frame {
     /// The current implementation only accepts error-free RS codewords, so
     /// this value is zero until full RS correction is implemented.
     pub corrected_errors: usize,
+    /// CRC-32C verification result for modes that carry a CRC trailer
+    /// ([`Ax100Mode::AsmGolayCrc`]). `None` for RS-protected modes, which
+    /// rely on the Reed-Solomon syndrome instead of a separate CRC.
+    pub crc_ok: Option<bool>,
     /// ASM+Golay header flags. In Reed-Solomon mode these are all false.
     pub flags: Ax100Flags,
 }
@@ -248,8 +334,11 @@ pub struct Ax100Frame {
 pub enum Ax100Mode {
     /// AX100 Reed-Solomon mode.
     ReedSolomon,
-    /// AX100 ASM+Golay mode.
+    /// AX100 ASM+Golay mode with CCSDS scrambling and RS(255,223).
     AsmGolay,
+    /// AX100 ASM+Golay mode with CCSDS scrambling and a CRC-32C trailer,
+    /// without Reed-Solomon. Used by the GreenCube / IO-117 digipeater.
+    AsmGolayCrc,
 }
 
 /// Flags carried in AX100 ASM+Golay style headers.
@@ -274,7 +363,58 @@ pub fn ax100_syncword() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fec::{golay, reed_solomon};
+    use crate::fec::{crc32c, golay, reed_solomon};
+
+    /// Build a GreenCube / IO-117 ASM+Golay+CRC packet from a CSP frame:
+    /// append the CRC-32C trailer, pad with `PARITY_LEN` placeholder
+    /// parity bytes (a systematic RS codeword's parity region, which this
+    /// decoder strips without decoding), CCSDS-scramble the whole field,
+    /// and prepend the Golay length header.
+    fn build_crc_packet(csp_frame: &[u8]) -> Vec<u8> {
+        let mut field = csp_frame.to_vec();
+        field.extend_from_slice(&crc32c::checksum(csp_frame).to_be_bytes());
+        field.extend(std::iter::repeat(0xAB).take(reed_solomon::PARITY_LEN));
+        ccsds_randomizer::xor_sequence(&mut field);
+        let header = golay::encode(field.len() as u16);
+        let mut packet = vec![
+            ((header >> 16) & 0xff) as u8,
+            ((header >> 8) & 0xff) as u8,
+            (header & 0xff) as u8,
+        ];
+        packet.extend_from_slice(&field);
+        packet
+    }
+
+    #[test]
+    fn decodes_asm_golay_crc_greencube_frame() {
+        let csp_frame = b"\x82\x97\x64\x00\x1d\x03R7LP>CQ, GreenCube, STORE=0 KN96";
+        let packet = build_crc_packet(csp_frame);
+
+        let decoder = Ax100Decoder::new();
+        let frame = decoder
+            .decode_asm_golay_crc(&packet)
+            .expect("valid GreenCube ASM+Golay+CRC packet");
+
+        assert_eq!(frame.mode, Ax100Mode::AsmGolayCrc);
+        assert_eq!(frame.payload, csp_frame);
+        assert_eq!(frame.crc_ok, Some(true));
+        assert!(frame.flags.scrambler);
+        assert!(!frame.flags.reed_solomon);
+    }
+
+    #[test]
+    fn asm_golay_crc_flags_bit_error_as_crc_failure() {
+        let csp_frame = b"\x82\x97\x64\x00\x1d\x03R7LP>CQ, GreenCube, STORE=0 KN96";
+        let mut packet = build_crc_packet(csp_frame);
+        // Flip a bit inside the message region (after the 3-byte header).
+        packet[10] ^= 0x01;
+
+        let decoder = Ax100Decoder::new();
+        let frame = decoder
+            .decode_asm_golay_crc(&packet)
+            .expect("packet still parses structurally");
+        assert_eq!(frame.crc_ok, Some(false));
+    }
 
     #[test]
     fn decodes_reed_solomon_mode_packet() {

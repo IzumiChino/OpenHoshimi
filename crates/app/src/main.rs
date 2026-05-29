@@ -3519,12 +3519,23 @@ fn decoded_frame_row(
             }
             raw = payload;
         }
-        DecodedFrame::Ax100 { payload, .. } => {
+        DecodedFrame::Ax100 {
+            payload, crc_ok, ..
+        } => {
             source = "AX100".to_string();
             destination = "FEC".to_string();
-            kind = FrameKind::Tlm;
-            if let Some(parser) = telemetry {
-                fields = parser.parse_bytes(&payload);
+            // CRC-trailer modes mark a failed checksum as an error frame;
+            // RS-protected modes report `crc_ok = None` and stay Tlm.
+            kind = if crc_ok == Some(false) {
+                FrameKind::Err
+            } else {
+                FrameKind::Tlm
+            };
+            // Never interpret a CRC-failed payload as housekeeping values.
+            if crc_ok != Some(false) {
+                if let Some(parser) = telemetry {
+                    fields = parser.parse_bytes(&payload);
+                }
             }
             raw = payload;
         }

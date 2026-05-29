@@ -588,15 +588,31 @@ fn print_decoded_frame(
             mode,
             payload,
             corrected_errors,
+            crc_ok,
         } => {
+            let status = match crc_ok {
+                Some(true) => "  [CRC ok]",
+                Some(false) => "  [CRC FAIL]",
+                None => "",
+            };
             println!(
-                "#{index:03}  {}  AX100/{:<11}  [GOMspace AX100]  {} bytes  corrected={corrected_errors}",
+                "#{index:03}  {}  AX100/{:<11}  [GOMspace AX100]  {} bytes  corrected={corrected_errors}{status}",
                 format_timestamp(timestamp),
                 ax100_mode_label(mode),
                 payload.len()
             );
-            println!("      raw: {}", format_hex(raw));
-            print_telemetry_fields(telemetry, &payload);
+            println!("      payload: {}", format_hex(&payload));
+            let ascii: String = payload
+                .iter()
+                .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                .collect();
+            println!("      ascii:   {ascii}");
+            // Only surface telemetry for frames whose integrity is
+            // confirmed; CRC-failed payloads carry residual bit errors and
+            // must not be interpreted as housekeeping values.
+            if crc_ok != Some(false) {
+                print_telemetry_fields(telemetry, &payload);
+            }
         }
         DecodedFrame::Geoscan(geoscan) => {
             print_geoscan_frame(index, timestamp, &geoscan, raw);
@@ -711,6 +727,7 @@ fn ax100_mode_label(mode: Ax100Mode) -> &'static str {
     match mode {
         Ax100Mode::ReedSolomon => "rs",
         Ax100Mode::AsmGolay => "asm-golay",
+        Ax100Mode::AsmGolayCrc => "asm-golay-crc",
     }
 }
 

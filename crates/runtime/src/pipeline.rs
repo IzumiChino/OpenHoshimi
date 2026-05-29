@@ -91,6 +91,9 @@ pub enum DecodedFrame {
         payload: Vec<u8>,
         /// Number of corrected Reed-Solomon bytes.
         corrected_errors: usize,
+        /// CRC-32C verification result for CRC-trailer modes
+        /// ([`Ax100Mode::AsmGolayCrc`]); `None` for RS-protected modes.
+        crc_ok: Option<bool>,
     },
     /// Geoscan custom frame (CC11xx PN9-descrambled fixed-size payload).
     Geoscan(GeoscanFrame),
@@ -1431,6 +1434,7 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
         Some(CodecDef::GomspaceAx100 { mode }) => Some(CodecKind::GomspaceAx100(match mode {
             Ax100ModeDef::ReedSolomon => Ax100Mode::ReedSolomon,
             Ax100ModeDef::AsmGolay => Ax100Mode::AsmGolay,
+            Ax100ModeDef::AsmGolayCrc => Ax100Mode::AsmGolayCrc,
         })),
         Some(CodecDef::Unknown) => Some(CodecKind::Unknown),
         Some(CodecDef::Ccsds) => Some(CodecKind::Ccsds),
@@ -1496,6 +1500,7 @@ impl CodecStage {
                 let frame_result = match mode {
                     Ax100Mode::ReedSolomon => decoder.decode_reed_solomon(&frame.raw),
                     Ax100Mode::AsmGolay => decoder.decode_asm_golay(&frame.raw),
+                    Ax100Mode::AsmGolayCrc => decoder.decode_asm_golay_crc(&frame.raw),
                 };
                 // For ASM+Golay packets that fail hard-decision RS, retry
                 // with soft-decision erasure marking when the framer
@@ -1530,6 +1535,7 @@ impl CodecStage {
                     mode: frame.mode,
                     payload: frame.payload,
                     corrected_errors: frame.corrected_errors,
+                    crc_ok: frame.crc_ok,
                 })
             }
             Self::Geoscan(decoder) => {

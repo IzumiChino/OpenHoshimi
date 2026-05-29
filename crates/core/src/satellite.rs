@@ -349,8 +349,12 @@ pub enum CodecDef {
 pub enum Ax100ModeDef {
     /// AX100 Reed-Solomon mode.
     ReedSolomon,
-    /// AX100 ASM and Golay mode.
+    /// AX100 ASM and Golay mode with CCSDS scrambling and RS(255,223).
     AsmGolay,
+    /// AX100 ASM and Golay mode with CCSDS scrambling and a CRC-32C
+    /// trailer, without Reed-Solomon. Used by the GreenCube / IO-117
+    /// digipeater downlink.
+    AsmGolayCrc,
 }
 
 /// Image-frame reassembly configuration.

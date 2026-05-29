@@ -80,6 +80,55 @@ impl Fec for Viterbi {
     }
 }
 
+/// CRC-32C (Castagnoli) used by libcsp / GOMspace AX100 frames.
+///
+/// Reflected input/output, init `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`,
+/// reversed polynomial `0x82F6_3B78`. This is the CRC the GreenCube /
+/// IO-117 ASM+Golay downlink appends after the CSP frame (verified
+/// against on-air captures: the 4-byte big-endian trailer equals
+/// `crc32c(csp_frame)`).
+pub(crate) mod crc32c {
+    const POLY: u32 = 0x82F6_3B78;
+
+    /// Compute the CRC-32C of `data`.
+    pub(crate) fn checksum(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (POLY & mask);
+            }
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn matches_known_vector() {
+            // Standard CRC-32C check value for the ASCII string
+            // "123456789".
+            assert_eq!(checksum(b"123456789"), 0xE306_9283);
+        }
+
+        #[test]
+        fn matches_greencube_frame_trailer() {
+            // On-air IO-117 digipeater frame: the descrambled CSP frame
+            // followed by its 4-byte big-endian CRC-32C trailer.
+            let frame: [u8; 43] = [
+                0x82, 0x97, 0x75, 0x00, 0x1D, 0x03, 0x34, 0x4F, 0x34, 0x41, 0x3E, 0x4F, 0x4E, 0x34,
+                0x43, 0x43, 0x4E, 0x2C, 0x20, 0x47, 0x72, 0x65, 0x65, 0x6E, 0x43, 0x75, 0x62, 0x65,
+                0x2C, 0x20, 0x53, 0x54, 0x4F, 0x52, 0x45, 0x3D, 0x30, 0x20, 0x4A, 0x4E, 0x39, 0x32,
+                0x0A,
+            ];
+            assert_eq!(checksum(&frame), 0x72CC_25E0);
+        }
+    }
+}
+
 pub(crate) mod ccsds_randomizer {
     const POLY_MASK: u8 = 0xa9;
     const INITIAL_STATE: u8 = 0xff;

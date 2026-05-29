@@ -13,24 +13,34 @@
 # amateur digital satellites in operation.
 #
 # Downlink at 435.310 MHz uses plain FSK with the GOMspace AX100
-# framing (32-bit attached sync marker 0x930B51DE, 3-byte Golay(24,12)
-# header, 255-byte CCSDS-randomised RS(255,223) codeword). The SatNOGS
-# transmitter database labels these as "GMSK" colloquially, but the
-# gr-satellites GREENCUBE definition and the on-air signal are
-# rectangular-pulse FSK (no transmit Gaussian filter); the matched
-# receive filter is therefore a square-pulse / integrate-and-dump
-# stage, not a Gaussian one. Configuring the runtime modem with plain
-# FSK and no `gaussian_bt` selects that path.
+# ASM+Golay link layer: 32-bit attached sync marker 0x930B51DE, a
+# 3-byte Golay(24,12) header whose low 8 bits give the encoded length,
+# and a CCSDS-randomised payload. After descrambling, the field is a
+# variable-length CSP frame + a 4-byte big-endian CRC-32C (libcsp
+# Castagnoli) over that CSP frame, followed by a 32-byte trailing block
+# (the RS(255,223) parity size). That trailing block does not validate
+# as a standard CCSDS RS(255,223) codeword (checked in conventional and
+# dual-basis form across the common GF(256) polynomials), so the codec
+# does not run FEC: mode `asm_golay_crc` strips the 32 trailing bytes,
+# verifies the CRC-32C, and surfaces the CSP frame. Integrity rests on
+# the CRC (verified against on-air SatNOGS captures); frames with
+# residual demod bit errors fail the CRC and are dropped. The SatNOGS transmitter
+# database labels these as "GMSK" colloquially, but the gr-satellites
+# GREENCUBE definition and the on-air signal are rectangular-pulse FSK
+# (no transmit Gaussian filter); the matched receive filter is
+# therefore a square-pulse / integrate-and-dump stage, not a Gaussian
+# one. Configuring the runtime modem with plain FSK and no `gaussian_bt`
+# selects that path.
 #
 # gr-satellites lists six baudrate variants (300, 600, 1k2, 2k4, 4k8,
 # 9k6); operationally the digipeater runs at 1k2 most of the time, with
 # experimental 9k6 slots announced by the operator. We declare two
 # downlink rows so the GUI can pick the one matching the recording.
 #
-# Telemetry interpretation is intentionally omitted: the on-orbit packet
-# format is documented in the GreenCube user manual but is not yet wired
-# up here. The decode chain stops at the AX100 codec, surfacing the
-# decoded RS(255,223) payload + corrected-error count for inspection.
+# The decode chain stops at the AX100 codec, surfacing the decoded
+# CSP payload (CRC trailer stripped) plus the CRC-32C verification
+# result. Housekeeping telemetry is parsed only for CRC-valid 101-byte
+# HK frames (see the [telemetry.io117] schema below).
 
 [satellite]
 name = "IO-117"
@@ -39,7 +49,7 @@ norad_id = 53106
 
 # Telemetry layout follows tomvdb/tlm-greencube-plugin's Kaitai struct,
 # which derives from S5Lab's published decoding notes for LEDSAT/GreenCube.
-# Each AX100 RS(255,223)-decoded payload is a 101-byte CSP frame: a 4-byte
+# Each CRC-valid HK payload is a 101-byte CSP frame: a 4-byte
 # CSP header, a 16-bit big-endian telemetry id (`tlm_id`, valid values
 # 13840 / 13841 / 13842 / 30234), and a 95-byte fixed-format housekeeping
 # block. Voltages, currents and GPS coordinates are surfaced as raw
@@ -69,7 +79,7 @@ threshold = 4
 
 [downlink.codec]
 kind = "gomspace_ax100"
-mode = "asm_golay"
+mode = "asm_golay_crc"
 
 [[downlink]]
 label = "9k6 FSK digipeater"
@@ -94,7 +104,7 @@ threshold = 4
 
 [downlink.codec]
 kind = "gomspace_ax100"
-mode = "asm_golay"
+mode = "asm_golay_crc"
 
 # Telemetry schema for the IO-117 / GreenCube 101-byte CSP frame, mirroring
 # tomvdb/tlm-greencube-plugin's Kaitai layout (MIT, S5Lab decoding notes for
