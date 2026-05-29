@@ -132,9 +132,11 @@ fn afsk_1k2_aprs_roundtrip_through_pipeline() {
     let frame_bytes = ax25_ui_frame("APRS", "OPNHSH", info);
     let hdlc_bits = hdlc_encode(&frame_bytes);
     // Insert a long preamble of HDLC flags so the AFSK detector locks
-    // before payload bits arrive.
+    // before payload bits arrive. The zero-crossing timing recovery needs
+    // several mark/space transitions to converge; 32 flags (256 bits with
+    // a transition every 8 bits) provides ample lock time.
     let mut preamble_bits = Vec::new();
-    for _ in 0..16 {
+    for _ in 0..32 {
         preamble_bits.extend_from_slice(&bits_lsb_first(HDLC_FLAG));
     }
     let mut all_bits = preamble_bits;

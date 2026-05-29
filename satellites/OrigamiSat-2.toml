@@ -1,0 +1,50 @@
+# OrigamiSat-2 / Fuji-OSCAR 126 (FO-126)
+#
+# Institute of Science Tokyo (formerly Tokyo Tech) membrane antenna
+# technology demonstrator. Launched 2026-04-23 on Electron from
+# Rocket Lab LC-1.
+#
+# UHF: 437.505 MHz AFSK 1200 baud AX.25 telemetry + CW beacon.
+# C-Band: 5840 MHz high-speed data (BPSK/QPSK, baudrate TBD).
+#
+# References:
+#   http://www.origami.titech.ac.jp/archives/1958
+#   https://db.satnogs.org/satellite/FDQL-7890-4040-6919-7625
+
+[satellite]
+name = "OrigamiSat-2"
+aliases = ["FO-126", "JS1YRU", "Fuji-OSCAR 126"]
+norad_id = 68795
+
+[[downlink]]
+label = "1k2 AFSK telemetry"
+freq_hz = 437_505_000
+modulation = "AFSK"
+baudrate = 1200
+framing = "AX25"
+
+[downlink.modem]
+kind = "afsk"
+mark_hz = 1200.0
+space_hz = 2200.0
+
+[downlink.line_coding]
+kind = "nrzi"
+
+[downlink.framer]
+kind = "hdlc"
+
+[downlink.codec]
+kind = "ax25"
+
+# 5.8 GHz high-speed data downlink. Baudrate and framing protocol are
+# not yet publicly documented; this definition will be updated once the
+# Institute of Science Tokyo publishes the ICD or SatNOGS observations
+# confirm the parameters.
+#
+# [[downlink]]
+# label = "5.8 GHz BPSK high-speed data"
+# freq_hz = 5_840_000_000
+# modulation = "BPSK"
+# baudrate = 0  # TBD
+# framing = "UNKNOWN"
