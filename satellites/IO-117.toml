@@ -72,6 +72,10 @@ frequency_offset_hz = 0.0
 differential = false
 invert = false
 swap_iq = false
+# A 64-symbol DC blocker (vs the default 32) lowers the FM-audio high-pass
+# corner so it removes less of the signal's own low-frequency content. On
+# satnogs_7633827 this recovers ~24 CRC-valid frames vs ~18 at the default.
+dc_blocker_symbols = 64
 
 [downlink.framer]
 kind = "ax100_asm"
@@ -97,6 +101,10 @@ frequency_offset_hz = 0.0
 differential = false
 invert = false
 swap_iq = false
+# A 64-symbol DC blocker (vs the default 32) lowers the FM-audio high-pass
+# corner so it removes less of the signal's own low-frequency content. On
+# satnogs_7633827 this recovers ~24 CRC-valid frames vs ~18 at the default.
+dc_blocker_symbols = 64
 
 [downlink.framer]
 kind = "ax100_asm"

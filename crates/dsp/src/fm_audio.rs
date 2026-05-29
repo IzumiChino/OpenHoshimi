@@ -10,8 +10,9 @@
 //!    receive filter for GMSK. Runs first so the long DC blocker that
 //!    follows sees the symbol-rate-shaped signal rather than the raw
 //!    discriminator output.
-//! 2. Long moving-average DC blocker (32 symbols of memory) so the loop
-//!    sees zero-mean input even when the front-end leaves a slow envelope.
+//! 2. Long moving-average DC blocker (32 symbols of memory by default,
+//!    configurable via `dc_blocker_symbols`) so the loop sees zero-mean
+//!    input even when the front-end leaves a slow envelope.
 //! 3. RMS AGC with a 50-symbol time constant so the timing detector sees
 //!    unit-variance input regardless of burst level.
 //! 4. First-order proportional Mueller-Muller timing-error detector,
@@ -51,7 +52,18 @@ pub struct FmAudioConfig {
     pub differential: bool,
     /// Invert hard symbol decisions.
     pub invert: bool,
+    /// Length of the moving-average DC blocker, in symbols. The blocker is
+    /// a high-pass filter with corner near `baudrate / dc_blocker_symbols`;
+    /// a longer window lowers that corner and removes less of the signal's
+    /// own low-frequency content, at the cost of tracking a slowly drifting
+    /// DC offset more slowly. gr-satellites uses 32; some downlinks decode
+    /// noticeably better with a longer window (see IO-117).
+    pub dc_blocker_symbols: f32,
 }
+
+/// Default DC-blocker length in symbols, matching gr-satellites'
+/// `dc_blocker_ff(ceil(sps*32), True)`.
+pub const DEFAULT_DC_BLOCKER_SYMBOLS: f32 = 32.0;
 
 impl FmAudioConfig {
     /// Create a configuration with conservative defaults (plain FSK, no
@@ -63,6 +75,7 @@ impl FmAudioConfig {
             gaussian_bt: None,
             differential: false,
             invert: false,
+            dc_blocker_symbols: DEFAULT_DC_BLOCKER_SYMBOLS,
         }
     }
 
@@ -74,7 +87,17 @@ impl FmAudioConfig {
             gaussian_bt: Some(bt),
             differential: false,
             invert: false,
+            dc_blocker_symbols: DEFAULT_DC_BLOCKER_SYMBOLS,
         }
+    }
+
+    /// Override the DC-blocker length, in symbols. Values are clamped to at
+    /// least 2 symbols. Returns `self` for chaining.
+    pub fn with_dc_blocker_symbols(mut self, symbols: f32) -> Self {
+        if symbols.is_finite() && symbols >= 2.0 {
+            self.dc_blocker_symbols = symbols;
+        }
+        self
     }
 }
 
@@ -127,8 +150,12 @@ impl FmAudioDemodulator {
         // `python/components/demodulators/fsk_demodulator.py:156-164`.
         // The matched filter has unit DC gain, so any residual offset
         // from the front-end remains and the long boxcar HPF is the
-        // right thing to remove it.
-        let dc_len = (samples_per_symbol * 32.0).ceil().max(2.0) as usize;
+        // right thing to remove it. The window length is configurable
+        // (`dc_blocker_symbols`, default 32) because some downlinks decode
+        // better with a lower HPF corner (see IO-117).
+        let dc_len = (samples_per_symbol * config.dc_blocker_symbols)
+            .ceil()
+            .max(2.0) as usize;
         let dc_blocker = BoxcarFilter::new(dc_len);
         let agc = RmsAgc::new(samples_per_symbol);
         // First-order proportional Mueller-Muller. Two attempts at a

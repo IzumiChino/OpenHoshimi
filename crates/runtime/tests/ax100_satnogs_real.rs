@@ -37,10 +37,12 @@ const SAMPLE_BUFFER: usize = 32_768;
 // (large OGG); the test is gated on OPENHOSHIMI_SATNOGS_RECORDINGS and
 // skips when the file or the env flag is absent.
 const RECORDING: &str = "satnogs_7633827_2023-05-28T11-11-08.ogg";
-// Lower bound on CRC-32C-valid frames. The honest CRC sweep recovers ~18
-// over the high-elevation pass; 10 leaves headroom for small demod tweaks
-// while still catching a framing/descrambler/CRC regression.
-const MIN_CRC_VALID: usize = 10;
+// Lower bound on CRC-32C-valid frames. With the 64-symbol DC blocker the
+// honest CRC sweep recovers ~24 over the high-elevation pass (up from ~18
+// at the default 32-symbol blocker); 20 leaves headroom for small demod
+// tweaks while still catching a framing / descrambler / CRC / DC-blocker
+// regression.
+const MIN_CRC_VALID: usize = 20;
 
 fn io117_1k2_downlink() -> DownlinkDef {
     DownlinkDef {
@@ -58,6 +60,9 @@ fn io117_1k2_downlink() -> DownlinkDef {
             differential: false,
             invert: false,
             swap_iq: false,
+            // Match satellites/IO-117.toml: a 64-symbol DC blocker lowers the
+            // HPF corner and recovers more frames than the default 32.
+            dc_blocker_symbols: Some(64.0),
         }),
         line_coding: None,
         descrambler: None,

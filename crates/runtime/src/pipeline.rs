@@ -1076,6 +1076,7 @@ fn fm_audio_config(downlink: &DownlinkDef, sample_rate: u32) -> Result<FmAudioCo
             gaussian_bt,
             differential,
             invert,
+            dc_blocker_symbols,
             ..
         }) => {
             let mut config = match gaussian_bt {
@@ -1084,6 +1085,9 @@ fn fm_audio_config(downlink: &DownlinkDef, sample_rate: u32) -> Result<FmAudioCo
             };
             config.differential = *differential;
             config.invert = *invert;
+            if let Some(symbols) = dc_blocker_symbols {
+                config = config.with_dc_blocker_symbols(*symbols);
+            }
             Ok(config)
         }
         Some(_) => Err(format!(
@@ -1136,6 +1140,8 @@ fn build_iq_demodulator(
             differential,
             invert,
             swap_iq,
+            // FM-audio-only knob; the IQ CPM path does not use it.
+            dc_blocker_symbols: _,
         }) => {
             let mut config = CpmConfig::new(sample_rate, downlink.baudrate, map_cpm_mode(*mode));
             if let Some(value) = modulation_index {
