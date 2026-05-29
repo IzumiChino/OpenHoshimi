@@ -158,6 +158,13 @@ pub enum ModemDef {
         /// Swap I and Q before demodulation.
         #[serde(default)]
         swap_iq: bool,
+        /// Length of the FM-audio DC-blocker high-pass, in symbols. `None`
+        /// uses the default (32). A longer window lowers the HPF corner and
+        /// removes less signal content; some FSK downlinks (e.g. IO-117)
+        /// decode noticeably better with 64. Only affects the FM-audio
+        /// demodulator path; ignored for the IQ CPM path.
+        #[serde(default)]
+        dc_blocker_symbols: Option<f32>,
     },
     /// Linear phase modulation over IQ.
     Linear {

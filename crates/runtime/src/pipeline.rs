@@ -1076,6 +1076,7 @@ fn fm_audio_config(downlink: &DownlinkDef, sample_rate: u32) -> Result<FmAudioCo
             gaussian_bt,
             differential,
             invert,
+            dc_blocker_symbols,
             ..
         }) => {
             let mut config = match gaussian_bt {
@@ -1084,6 +1085,9 @@ fn fm_audio_config(downlink: &DownlinkDef, sample_rate: u32) -> Result<FmAudioCo
             };
             config.differential = *differential;
             config.invert = *invert;
+            if let Some(symbols) = dc_blocker_symbols {
+                config = config.with_dc_blocker_symbols(*symbols);
+            }
             Ok(config)
         }
         Some(_) => Err(format!(
@@ -1136,6 +1140,8 @@ fn build_iq_demodulator(
             differential,
             invert,
             swap_iq,
+            // FM-audio-only knob; the IQ CPM path does not use it.
+            dc_blocker_symbols: _,
         }) => {
             let mut config = CpmConfig::new(sample_rate, downlink.baudrate, map_cpm_mode(*mode));
             if let Some(value) = modulation_index {
@@ -1522,6 +1528,22 @@ impl CodecStage {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(32);
                 let frame_result = match (frame_result, *mode, frame.soft_bits.as_deref()) {
+                    // CRC-aided soft-decision Chase: an AsmGolayCrc frame that
+                    // structurally decodes but fails CRC-32C is retried by
+                    // flipping its least-reliable payload bits (ranked by
+                    // |soft|) until the CRC passes. CRC-32C is the oracle
+                    // (~2^-32 false-accept), so a flip pattern that satisfies
+                    // it is the transmitted frame to that confidence. The
+                    // payload has no FEC, so this is the only way to correct
+                    // residual demod bit errors for this mode.
+                    (Ok(decoded), Ax100Mode::AsmGolayCrc, Some(soft))
+                        if decoded.crc_ok == Some(false) && soft.len() == frame.raw.len() * 8 =>
+                    {
+                        match decoder.decode_asm_golay_crc_chase(&frame.raw, soft) {
+                            Ok(Some(rescued)) => Ok(rescued),
+                            _ => Ok(decoded),
+                        }
+                    }
                     (Ok(frame), _, _) => Ok(frame),
                     (Err(_), Ax100Mode::AsmGolay, Some(soft))
                         if soft.len() == frame.raw.len() * 8 && erasure_k > 0 =>
