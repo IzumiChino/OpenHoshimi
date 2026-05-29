@@ -47,7 +47,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist/${{ matrix.artifact }}
-          cp target/${{ matrix.target }}/release/openhoshimi-app dist/${{ matrix.artifact }}/
+          cp target/${{ matrix.target }}/release/openhoshimi dist/${{ matrix.artifact }}/
           cp target/${{ matrix.target }}/release/decode_file dist/${{ matrix.artifact }}/
           cp target/${{ matrix.target }}/release/sat_tool dist/${{ matrix.artifact }}/
           cp -r satellites/ dist/${{ matrix.artifact }}/
@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
-          Copy-Item target/${{ matrix.target }}/release/openhoshimi-app.exe dist/${{ matrix.artifact }}/
+          Copy-Item target/${{ matrix.target }}/release/openhoshimi.exe dist/${{ matrix.artifact }}/
           Copy-Item target/${{ matrix.target }}/release/decode_file.exe dist/${{ matrix.artifact }}/
           Copy-Item target/${{ matrix.target }}/release/sat_tool.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse satellites/ dist/${{ matrix.artifact }}/
