@@ -1557,10 +1557,7 @@ impl CodecStage {
                 // almost certainly a false positive on non-RS data. Reject
                 // rather than surface garbage payloads.
                 let frame_result = match frame_result {
-                    Ok(ref f)
-                        if *mode == Ax100Mode::AsmGolay
-                            && f.corrected_errors >= 32 =>
-                    {
+                    Ok(ref f) if *mode == Ax100Mode::AsmGolay && f.corrected_errors >= 32 => {
                         Err(DecodeError::CrcMismatch)
                     }
                     other => other,

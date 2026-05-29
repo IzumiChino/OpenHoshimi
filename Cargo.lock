@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "cpm_dump"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "clap",
  "crc",
@@ -1002,7 +1002,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decode_file"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "clap",
  "openhoshimi-codec",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "iq_inspect"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -2705,7 +2705,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openhoshimi-app"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-codec"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-core"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-dsp"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2749,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-io"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "cpal",
  "lewton",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-runtime"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "crc",
  "openhoshimi-codec",
@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-telemetry"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "openhoshimi-core",
 ]
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "sat_tool"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -3699,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "syncword_scan"
-version = "1.4.5"
+version = "1.5.1"
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -3974,9 +3974,9 @@ dependencies = [
 
 [[package]]
 name = "typenum"
-version = "1.20.0"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uds_windows"
