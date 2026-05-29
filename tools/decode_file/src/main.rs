@@ -15,7 +15,7 @@ use openhoshimi_dsp::estimate_audio_carrier;
 use openhoshimi_dsp::linear::open_symbol_dump;
 use openhoshimi_io::{
     detect_audio_mode_auto, open_audio_source, read_audio_prefix, read_iq_prefix,
-    AudioMode as IoAudioMode, MonoIqSource, WavIqSource, WavSource,
+    AudioMode as IoAudioMode, MonoIqSource, WavIqSource,
 };
 use openhoshimi_runtime::pipeline::{
     estimate_cpm_iq_frequency_offset_hz, estimate_iq_frequency_offset_hz, format_call, format_hex,
@@ -114,20 +114,13 @@ fn run() -> Result<(), String> {
     let tuning_offset_hz =
         infer_tuning_offset_hz(&args.input_wav, selected.downlink.freq_hz).unwrap_or(0) as f32;
     let mut runner = match selected.input_kind {
-        InputKind::Audio => PipelineRunner::Audio {
-            source: {
-                WavSource::open(&args.input_wav)
-                    .map_err(|err| format!("failed to open audio WAV: {err}"))?
-            },
-            pipeline: {
-                let source = WavSource::open(&args.input_wav)
-                    .map_err(|err| format!("failed to open audio WAV: {err}"))?;
-                let sample_rate = source.sample_rate();
-                let mut pipeline = BitPipeline::<f32>::new(selected.downlink)?;
-                pipeline.configure_demodulator(selected.downlink, sample_rate, 0.0)?;
-                pipeline
-            },
-        },
+        InputKind::Audio => {
+            let source: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
+            let sample_rate = source.sample_rate();
+            let mut pipeline = BitPipeline::<f32>::new(selected.downlink)?;
+            pipeline.configure_demodulator(selected.downlink, sample_rate, 0.0)?;
+            PipelineRunner::Audio { source, pipeline }
+        }
         InputKind::FmAudio => {
             let source: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
             let sample_rate = source.sample_rate();
@@ -361,7 +354,7 @@ fn run() -> Result<(), String> {
 
 enum PipelineRunner {
     Audio {
-        source: WavSource,
+        source: Box<dyn InputSource>,
         pipeline: BitPipeline<f32>,
     },
     FmAudio {
