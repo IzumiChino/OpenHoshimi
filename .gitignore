@@ -6,7 +6,12 @@ target/
 *.ogg
 *.zip
 *.iq.wav
+*.raw
 EMrecording*/
 Custom_Signal/
 test_data/
+test_recordings/
 frame*.bin
+
+# Reference documents (keep locally, not in repo).
+*.pdf
