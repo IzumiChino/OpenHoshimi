@@ -806,20 +806,28 @@ fn linear_iq_tuning_candidates(
     prefix: &[IqSample],
     tuning_offset_hz: f32,
 ) -> Vec<f32> {
-    let mut candidates = Vec::with_capacity(8);
+    const MAX_CANDIDATES: usize = 6;
+    let mut candidates = Vec::with_capacity(MAX_CANDIDATES);
     push_candidate(&mut candidates, tuning_offset_hz);
     push_candidate(&mut candidates, -tuning_offset_hz);
 
-    for carrier in linear_iq_carrier_candidates(downlink, prefix, sample_rate, 4) {
+    for carrier in linear_iq_carrier_candidates(downlink, prefix, sample_rate, 2) {
+        if candidates.len() >= MAX_CANDIDATES {
+            break;
+        }
         push_candidate(&mut candidates, carrier);
         push_candidate(&mut candidates, -carrier);
     }
 
-    if let Some(estimate) =
-        estimate_iq_frequency_offset_hz(prefix, sample_rate).filter(|value| value.is_finite())
-    {
-        push_candidate(&mut candidates, estimate);
-        push_candidate(&mut candidates, -estimate);
+    if candidates.len() < MAX_CANDIDATES {
+        if let Some(estimate) =
+            estimate_iq_frequency_offset_hz(prefix, sample_rate).filter(|value| value.is_finite())
+        {
+            push_candidate(&mut candidates, estimate);
+            if candidates.len() < MAX_CANDIDATES {
+                push_candidate(&mut candidates, -estimate);
+            }
+        }
     }
 
     candidates
