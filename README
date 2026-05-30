@@ -1,0 +1,131 @@
+	    OpenHoshimi - Amateur Satellite Signal Decoder
+
+OpenHoshimi is a desktop application and toolkit for decoding telemetry
+and data from amateur radio satellites.  It takes IQ recordings, FM-
+demodulated audio, or live soundcard input and produces decoded frames
+with full forward-error-correction where applicable.
+
+The project is written in Rust and targets Linux, Windows, and macOS.
+
+
+1. Building
+-----------
+
+Requirements:
+
+  - Rust toolchain 1.75 or later (https://rustup.rs)
+  - A C compiler (for native dependencies)
+  - On Linux: ALSA development headers (libasound2-dev or alsa-lib-devel)
+
+To build the GUI application and all tools:
+
+	cargo build --release
+
+The main binary lands at target/release/openhoshimi.  Offline decode
+tools (decode_file, iq_inspect, sat_tool, syncword_scan, cpm_dump) are
+in the same directory.
+
+
+2. Running
+----------
+
+Launch the GUI:
+
+	./target/release/openhoshimi
+
+Select a satellite from the left panel, choose an input source (WAV/OGG
+file or soundcard), and press Start.  Decoded frames appear in the frame
+list with hex payload and optional telemetry fields.
+
+Offline batch decode (no GUI):
+
+	./target/release/decode_file satellites/IO-117.toml recording.ogg
+
+
+3. Supported Satellites
+-----------------------
+
+Each satellite is defined by a TOML file under satellites/.  The decoder
+is satellite-agnostic; all protocol-specific parameters live in the TOML
+definition.  Currently shipped:
+
+  Satellite        Frequency       Modulation     Framing
+  ---------        ---------       ----------     -------
+  AO-73            145.935 MHz     BPSK 1k2       AO-40 FEC
+  IO-117           435.310 MHz     FSK 1k2/9k6    AX100 ASM+Golay
+  ISS (APRS)       145.825 MHz     AFSK 1k2       AX.25
+  CAS-4A           145.835 MHz     GMSK 4k8       AX.25 + G3RUH
+  CAS-4B           145.890 MHz     GMSK 4k8       AX.25 + G3RUH
+  CAS-5A           145.725 MHz     GMSK 4k8       AX.25 + G3RUH
+  LUME-1           437.060 MHz     GMSK 4k8       AX100 RS
+  AlfaCrux         437.100 MHz     GMSK 4k8       AX100 RS
+  SO-124           436.880 MHz     GMSK 4k8       AX100 RS
+  StratoSat TK-1   435.800 MHz     GMSK 4k8       AX.25 + G3RUH
+  Hyacinth-1       435.400 MHz     GMSK 4k8       CCSDS ASM
+  OrigamiSat-2     437.505 MHz     AFSK 1k2       AX.25
+  ASRTU-1          435.400 MHz     BPSK 9k6       CCSDS Concatenated
+
+Adding a new satellite requires only a new TOML file; no Rust code
+changes are needed.
+
+
+4. Project Layout
+-----------------
+
+  crates/core       Shared types, error definitions, trait interfaces
+  crates/dsp        DSP primitives: demodulators, framers, descramblers
+  crates/codec      Frame decoders: AX.25, AO-40, AX100, CCSDS, SSDV
+  crates/io         Audio/IQ file readers, soundcard input (CPAL)
+  crates/runtime    Pipeline assembly, IQ alignment, satellite loader
+  crates/telemetry  Telemetry field extraction and scaling
+  crates/app        egui desktop GUI
+  tools/            Command-line utilities (decode_file, sat_tool, etc.)
+  satellites/       TOML satellite definitions
+
+
+5. Input Modes
+--------------
+
+  IQ recording     Stereo WAV with I/Q channels (any sample rate)
+  FM audio         Mono WAV/OGG from an FM discriminator output
+  SSB audio        Mono recording from an SSB receiver (--audio-mode ssb)
+  Soundcard        Live audio from a virtual or physical sound device
+
+
+6. Adding a Satellite
+---------------------
+
+Create a TOML file under satellites/ following the schema documented in
+crates/core/src/satellite.rs.  Use sat_tool to validate:
+
+	./target/release/sat_tool lint satellites/MySatellite.toml
+	./target/release/sat_tool info satellites/MySatellite.toml
+
+The TOML schema supports:
+
+  - Modulation: BPSK, DBPSK, QPSK, OQPSK, GMSK, FSK, AFSK
+  - Line coding: NRZ-I (NRZI)
+  - Descramblers: G3RUH, CCSDS
+  - Framers: HDLC, AO-40 sync, syncword-based (configurable ASM)
+  - Codecs: AX.25, AO-40 FEC, AX100 (RS / ASM+Golay / CRC), CCSDS
+    Concatenated (Viterbi + RS), FX.25, Geoscan, SSDV
+
+
+7. License
+----------
+
+OpenHoshimi is free software, released under the GNU General Public
+License version 3 or later.  See the COPYING file for details.
+
+
+8. Contributing
+---------------
+
+Patches are welcome.  Please ensure:
+
+  - cargo clippy --workspace --all-targets -- -D warnings passes clean
+  - cargo test --workspace passes
+  - No unwrap()/expect() in library crates
+  - Public APIs carry /// doc comments
+  - Satellite-specific logic belongs in TOML, not in Rust
+  - Commits are signed (git commit -s) with ASCII-only messages

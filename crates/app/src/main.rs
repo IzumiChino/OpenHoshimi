@@ -1,5 +1,6 @@
 //! egui desktop application for OpenHoshimi.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
@@ -55,14 +56,24 @@ const DEFAULT_WATERFALL_MIN_DB: f32 = -90.0;
 const DEFAULT_WATERFALL_MAX_DB: f32 = -10.0;
 const WATERFALL_DB_FLOOR: f32 = -160.0;
 const WATERFALL_DB_CEIL: f32 = 20.0;
-/// Linear-IQ alignment scorer prefix length, in seconds.  The cached
-/// prefix held for the decoder run remains the full 8 s (no samples
-/// dropped); only the scorer's per-trial sweep is shortened.  Two
-/// seconds is enough for the SyncwordFramer to lock at typical baud
-/// rates while keeping the polarity-and-skip search tractable.  If
-/// scoring returns zero frames against the short slice we fall back
-/// to the full prefix.
-const ALIGNMENT_SCORER_PREFIX_SEC: u32 = 2;
+/// Minimum alignment scorer prefix length in seconds.  For high baud rates
+/// (≥4800) one second contains multiple frames and is sufficient.  For low
+/// baud rates the actual prefix is extended to cover at least two frame
+/// durations (see `alignment_scorer_prefix_secs`).  The cached prefix held
+/// for the decoder run remains the full 8 s; only the scorer's per-trial
+/// sweep is shortened.  If scoring returns zero frames against the short
+/// slice we fall back to the full prefix.
+const ALIGNMENT_SCORER_MIN_PREFIX_SEC: f32 = 1.0;
+
+/// Compute the scorer prefix duration based on the downlink baud rate.
+/// Ensures at least two frame periods fit in the prefix so the framer can
+/// lock, while keeping the sweep fast for high-baud-rate signals.
+fn alignment_scorer_prefix_secs(baudrate: u32) -> f32 {
+    // Typical frame: ~256 bytes = ~2048 bits.  Two frames at the given
+    // baud rate gives the minimum time needed for the framer to lock.
+    let two_frames_sec = 2.0 * 2048.0 / baudrate.max(1) as f32;
+    ALIGNMENT_SCORER_MIN_PREFIX_SEC.max(two_frames_sec).min(4.0)
+}
 
 /// Application entry point.
 fn main() -> eframe::Result<()> {
@@ -313,6 +324,7 @@ enum DecodePace {
 
 impl OpenHoshimiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_fonts(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
 
         let satellites_dir = resolve_satellites_dir();
@@ -3017,6 +3029,7 @@ fn build_runtime_input(
                 }
             }
             Some(InputKind::Audio) | Some(InputKind::FmAudio) => {
+                let input_kind = input_kind_for(downlink);
                 let source = match soundcard_device.as_deref() {
                     Some(name) => SoundcardSource::open_by_name(name)
                         .map_err(|err| format!("soundcard open failed: {err}"))?,
@@ -3025,7 +3038,11 @@ fn build_runtime_input(
                 };
                 let sample_rate = source.sample_rate();
                 let mut pipeline = BitPipeline::<f32>::new(downlink)?;
-                pipeline.configure_demodulator(downlink, sample_rate, 0.0)?;
+                if input_kind == Some(InputKind::FmAudio) {
+                    pipeline.configure_fm_audio_demodulator(downlink, sample_rate)?;
+                } else {
+                    pipeline.configure_demodulator(downlink, sample_rate, 0.0)?;
+                }
                 Ok(RuntimeInput::Audio {
                     source: Box::new(source),
                     pipeline,
@@ -3324,8 +3341,8 @@ fn run_alignment_thread(
         }
     };
 
-    let scorer_prefix_len =
-        (sample_rate as usize * ALIGNMENT_SCORER_PREFIX_SEC as usize).min(prefix.len());
+    let scorer_secs = alignment_scorer_prefix_secs(downlink.baudrate);
+    let scorer_prefix_len = ((sample_rate as f32 * scorer_secs) as usize).min(prefix.len());
     let mut announced = false;
     let mut score_with = |samples: &[IqSample]| {
         let events_inner = events.clone();
@@ -3351,8 +3368,7 @@ fn run_alignment_thread(
     let mut scored = score_with(&prefix[..scorer_prefix_len]);
     if matches!(&scored, Some((_, frames)) if *frames == 0) && scorer_prefix_len < prefix.len() {
         let _ = events.send(RxEvent::Dropped(format!(
-            "alignment scorer found 0 frames in {} s slice; retrying with full {} s prefix",
-            ALIGNMENT_SCORER_PREFIX_SEC,
+            "alignment scorer found 0 frames in {scorer_secs:.1} s slice; retrying with full {} s prefix",
             prefix.len() / sample_rate.max(1) as usize,
         )));
         scored = score_with(&prefix);
@@ -3692,6 +3708,54 @@ where
         raw,
         telemetry: fields,
     })
+}
+
+/// Load embedded fonts with broad Unicode coverage (Latin Extended, Cyrillic,
+/// Greek, CJK) so non-ASCII text renders correctly on all platforms.
+fn configure_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+
+    let mut fonts = FontDefinitions::default();
+
+    // Noto Sans Mono: covers Latin, Latin Extended, Cyrillic, Greek, and more.
+    fonts.font_data.insert(
+        "noto_sans_mono".to_owned(),
+        FontData::from_static(include_bytes!("../assets/NotoSansMono-Regular.ttf")).into(),
+    );
+
+    // Noto Sans SC: covers CJK Unified Ideographs (Chinese/Japanese/Korean).
+    fonts.font_data.insert(
+        "noto_sans_sc".to_owned(),
+        FontData::from_static(include_bytes!("../assets/NotoSansSC-Regular.otf")).into(),
+    );
+
+    // Append as fallbacks AFTER the built-in Hack monospace font so that
+    // ASCII text keeps its original appearance and non-ASCII characters
+    // (Latin Extended, Cyrillic, CJK) fall through to these fonts.
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("noto_sans_mono".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("noto_sans_sc".to_owned());
+
+    // Also add as proportional fallbacks for any proportional text.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("noto_sans_mono".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("noto_sans_sc".to_owned());
+
+    ctx.set_fonts(fonts);
 }
 
 fn configure_style(ctx: &egui::Context) {
