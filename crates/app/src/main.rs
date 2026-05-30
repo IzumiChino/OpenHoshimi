@@ -1008,6 +1008,7 @@ impl OpenHoshimiApp {
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
         ui.horizontal_centered(|ui| {
             label_muted(ui, "Input:");
+            let prev_input_mode = self.input_mode;
             egui::ComboBox::from_id_salt("input_source")
                 .selected_text(self.input_source_label())
                 .width(180.0)
@@ -1015,6 +1016,9 @@ impl OpenHoshimiApp {
                     ui.selectable_value(&mut self.input_mode, InputMode::Soundcard, "Soundcard");
                     ui.selectable_value(&mut self.input_mode, InputMode::WavFile, "Audio file");
                 });
+            if self.input_mode != prev_input_mode {
+                self.stop();
+            }
             if matches!(self.input_mode, InputMode::Soundcard) {
                 self.soundcard_device_combo(ui);
             }
@@ -1051,11 +1055,13 @@ impl OpenHoshimiApp {
             );
             label_muted(ui, "Hz");
 
-            let audio_mode_enabled = matches!(self.input_mode, InputMode::WavFile)
-                && matches!(
-                    self.selected_downlink().and_then(input_kind_for),
-                    Some(InputKind::Iq)
-                );
+            // Audio mode is selectable for IQ/FmAudio downlinks in any input
+            // mode.  In soundcard mode this lets the user force FM-audio
+            // demodulation for mono virtual soundcard feeds (SDR# FM out).
+            let audio_mode_enabled = matches!(
+                self.selected_downlink().and_then(input_kind_for),
+                Some(InputKind::Iq) | Some(InputKind::FmAudio)
+            );
             label_muted(ui, "Audio:");
             let prev_audio_mode = self.audio_mode;
             ui.add_enabled_ui(audio_mode_enabled && !self.running, |ui| {
@@ -2634,7 +2640,7 @@ fn run_decode_thread(
     events: SyncSender<RxEvent>,
     stop: Receiver<()>,
 ) {
-    let _ = events.send(RxEvent::Dropped("priming WAV input\u{2026}".to_string()));
+    let _ = events.try_send(RxEvent::Dropped("priming WAV input\u{2026}".to_string()));
     let mut runtime = match build_runtime_input(
         input_mode,
         input_path,
@@ -2648,12 +2654,12 @@ fn run_decode_thread(
     ) {
         Ok(runtime) => runtime,
         Err(err) => {
-            let _ = events.send(RxEvent::Dropped(err));
-            let _ = events.send(RxEvent::Stopped);
+            let _ = events.try_send(RxEvent::Dropped(err));
+            let _ = events.try_send(RxEvent::Stopped);
             return;
         }
     };
-    let _ = events.send(RxEvent::SourceInfo {
+    let _ = events.try_send(RxEvent::SourceInfo {
         description: runtime.description().to_string(),
         sample_rate: runtime.sample_rate(),
     });
@@ -2665,7 +2671,7 @@ fn run_decode_thread(
         .map(SchemaParser::new);
     let sample_rate = runtime.sample_rate();
     let total_samples = runtime.total_samples();
-    let _ = events.send(RxEvent::Progress {
+    let _ = events.try_send(RxEvent::Progress {
         processed: 0,
         total: total_samples,
     });
@@ -2690,7 +2696,8 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => break,
                     Err(err) => {
-                        let _ = events.send(RxEvent::Dropped(format!("audio read failed: {err}")));
+                        let _ =
+                            events.try_send(RxEvent::Dropped(format!("audio read failed: {err}")));
                         break;
                     }
                 };
@@ -2710,8 +2717,8 @@ fn run_decode_thread(
                     &mut count,
                     frames,
                 );
-                let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
-                let _ = events.send(RxEvent::Progress {
+                let _ = events.try_send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
+                let _ = events.try_send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
                 });
@@ -2742,8 +2749,8 @@ fn run_decode_thread(
                         &mut count,
                         frames,
                     );
-                    let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
-                    let _ = events.send(RxEvent::Progress {
+                    let _ = events.try_send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
+                    let _ = events.try_send(RxEvent::Progress {
                         processed: pipeline.total_samples(),
                         total: total_samples,
                     });
@@ -2759,7 +2766,8 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => break,
                     Err(err) => {
-                        let _ = events.send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
+                        let _ =
+                            events.try_send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
                         break;
                     }
                 };
@@ -2779,8 +2787,8 @@ fn run_decode_thread(
                     &mut count,
                     frames,
                 );
-                let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
-                let _ = events.send(RxEvent::Progress {
+                let _ = events.try_send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
+                let _ = events.try_send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
                 });
@@ -2810,7 +2818,7 @@ fn run_decode_thread(
                         &mut count,
                         decoded,
                     );
-                    let _ = events.send(RxEvent::Progress {
+                    let _ = events.try_send(RxEvent::Progress {
                         processed: pipeline.total_samples(),
                         total: total_samples,
                     });
@@ -2826,7 +2834,8 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => break,
                     Err(err) => {
-                        let _ = events.send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
+                        let _ =
+                            events.try_send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
                         break;
                     }
                 };
@@ -2845,7 +2854,7 @@ fn run_decode_thread(
                     &mut count,
                     decoded,
                 );
-                let _ = events.send(RxEvent::Progress {
+                let _ = events.try_send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
                 });
@@ -2865,12 +2874,13 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => {
                         for image in analyzer.finish() {
-                            let _ = events.send(RxEvent::SstvImage(Box::new(image)));
+                            let _ = events.try_send(RxEvent::SstvImage(Box::new(image)));
                         }
                         break;
                     }
                     Err(err) => {
-                        let _ = events.send(RxEvent::Dropped(format!("audio read failed: {err}")));
+                        let _ =
+                            events.try_send(RxEvent::Dropped(format!("audio read failed: {err}")));
                         break;
                     }
                 };
@@ -2882,10 +2892,10 @@ fn run_decode_thread(
                 });
                 analyzer.push_samples(&samples[..read]);
                 for image in analyzer.drain_images() {
-                    let _ = events.send(RxEvent::SstvImage(Box::new(image)));
+                    let _ = events.try_send(RxEvent::SstvImage(Box::new(image)));
                 }
                 *processed_samples = processed_samples.saturating_add(read as u64);
-                let _ = events.send(RxEvent::Progress {
+                let _ = events.try_send(RxEvent::Progress {
                     processed: *processed_samples,
                     total: total_samples,
                 });
@@ -2898,7 +2908,7 @@ fn run_decode_thread(
         }
     }
 
-    let _ = events.send(RxEvent::Stopped);
+    let _ = events.try_send(RxEvent::Stopped);
 }
 
 fn pace_realtime_loop(
@@ -3002,54 +3012,67 @@ fn build_runtime_input(
         return build_sstv_runtime_input(input_mode, input_path, soundcard_device);
     }
     match input_mode {
-        InputMode::Soundcard => match input_kind_for(downlink) {
-            Some(InputKind::Iq) => {
-                let source = match soundcard_device.as_deref() {
-                    Some(name) => SoundcardIqSource::open_by_name(name)
-                        .map_err(|err| format!("soundcard IQ open failed: {err}"))?,
-                    None => SoundcardIqSource::open_default()
-                        .map_err(|err| format!("soundcard IQ open failed: {err}"))?,
-                };
-                let sample_rate = source.sample_rate();
-                if is_ao40_fec_downlink(downlink) {
-                    let pipeline = SoftAo40Pipeline::new(downlink, sample_rate, tuning_offset_hz)?;
-                    Ok(RuntimeInput::IqSoftAo40 {
-                        source: Box::new(source),
-                        pipeline: Box::new(pipeline),
-                        pending: Vec::new(),
-                    })
-                } else {
-                    let mut pipeline = BitPipeline::<IqSample>::new(downlink)?;
-                    pipeline.configure_demodulator(downlink, sample_rate, tuning_offset_hz)?;
-                    Ok(RuntimeInput::Iq {
+        InputMode::Soundcard => {
+            // Determine the effective input kind.  If the user explicitly
+            // selected FM or IQ in the audio mode dropdown, honour that
+            // choice over auto-detection.  This lets users feed FM-
+            // demodulated audio from a mono virtual soundcard to satellites
+            // whose definition would normally require IQ (e.g. Hyacinth-1
+            // GMSK via SDR# FM output).
+            let effective_kind = match audio_mode {
+                IoAudioMode::Fm => Some(InputKind::FmAudio),
+                IoAudioMode::Iq => Some(InputKind::Iq),
+                _ => input_kind_for(downlink),
+            };
+            match effective_kind {
+                Some(InputKind::Iq) => {
+                    let source = match soundcard_device.as_deref() {
+                        Some(name) => SoundcardIqSource::open_by_name(name)
+                            .map_err(|err| format!("soundcard IQ open failed: {err}"))?,
+                        None => SoundcardIqSource::open_default()
+                            .map_err(|err| format!("soundcard IQ open failed: {err}"))?,
+                    };
+                    let sample_rate = source.sample_rate();
+                    if is_ao40_fec_downlink(downlink) {
+                        let pipeline =
+                            SoftAo40Pipeline::new(downlink, sample_rate, tuning_offset_hz)?;
+                        Ok(RuntimeInput::IqSoftAo40 {
+                            source: Box::new(source),
+                            pipeline: Box::new(pipeline),
+                            pending: Vec::new(),
+                        })
+                    } else {
+                        let mut pipeline = BitPipeline::<IqSample>::new(downlink)?;
+                        pipeline.configure_demodulator(downlink, sample_rate, tuning_offset_hz)?;
+                        Ok(RuntimeInput::Iq {
+                            source: Box::new(source),
+                            pipeline,
+                            pending: Vec::new(),
+                        })
+                    }
+                }
+                Some(InputKind::Audio) | Some(InputKind::FmAudio) => {
+                    let source = match soundcard_device.as_deref() {
+                        Some(name) => SoundcardSource::open_by_name(name)
+                            .map_err(|err| format!("soundcard open failed: {err}"))?,
+                        None => SoundcardSource::open_default()
+                            .map_err(|err| format!("soundcard open failed: {err}"))?,
+                    };
+                    let sample_rate = source.sample_rate();
+                    let mut pipeline = BitPipeline::<f32>::new(downlink)?;
+                    if matches!(effective_kind, Some(InputKind::FmAudio)) {
+                        pipeline.configure_fm_audio_demodulator(downlink, sample_rate)?;
+                    } else {
+                        pipeline.configure_demodulator(downlink, sample_rate, 0.0)?;
+                    }
+                    Ok(RuntimeInput::Audio {
                         source: Box::new(source),
                         pipeline,
-                        pending: Vec::new(),
                     })
                 }
+                None => Err("selected downlink is not supported by soundcard input".to_string()),
             }
-            Some(InputKind::Audio) | Some(InputKind::FmAudio) => {
-                let input_kind = input_kind_for(downlink);
-                let source = match soundcard_device.as_deref() {
-                    Some(name) => SoundcardSource::open_by_name(name)
-                        .map_err(|err| format!("soundcard open failed: {err}"))?,
-                    None => SoundcardSource::open_default()
-                        .map_err(|err| format!("soundcard open failed: {err}"))?,
-                };
-                let sample_rate = source.sample_rate();
-                let mut pipeline = BitPipeline::<f32>::new(downlink)?;
-                if input_kind == Some(InputKind::FmAudio) {
-                    pipeline.configure_fm_audio_demodulator(downlink, sample_rate)?;
-                } else {
-                    pipeline.configure_demodulator(downlink, sample_rate, 0.0)?;
-                }
-                Ok(RuntimeInput::Audio {
-                    source: Box::new(source),
-                    pipeline,
-                })
-            }
-            None => Err("selected downlink is not supported by soundcard input".to_string()),
-        },
+        }
         InputMode::WavFile => {
             let Some(path) = input_path else {
                 return Err("missing WAV input path".to_string());
@@ -3081,14 +3104,14 @@ fn build_runtime_input(
                             });
                             let (setup, prefix) = if let Some(cached) = cache_hit {
                                 if cached.prefix.is_empty() && cached.setup.sample_skip == 0 {
-                                    let _ = events.send(RxEvent::Dropped(format!(
+                                    let _ = events.try_send(RxEvent::Dropped(format!(
                                         "IQ alignment (non-linear): tuning={:.1} Hz",
                                         cached.setup.tuning_offset_hz
                                     )));
                                 } else {
                                     let prefix_len = sample_rate as usize * 8;
                                     let _ = read_iq_prefix(&mut source, prefix_len)?;
-                                    let _ = events.send(RxEvent::Dropped(format!(
+                                    let _ = events.try_send(RxEvent::Dropped(format!(
                                         "IQ alignment (cached): tuning={:.1} Hz skip={} prefix_frames={}",
                                         cached.setup.tuning_offset_hz,
                                         cached.setup.sample_skip,
@@ -3098,12 +3121,12 @@ fn build_runtime_input(
                                 (cached.setup.clone(), cached.prefix.clone())
                             } else {
                                 let prefix_len = sample_rate as usize * 8;
-                                let _ = events.send(RxEvent::Dropped(format!(
+                                let _ = events.try_send(RxEvent::Dropped(format!(
                                     "reading 8 s IQ prefix at {} Hz\u{2026}",
                                     sample_rate
                                 )));
                                 let mut prefix = read_iq_prefix(&mut source, prefix_len)?;
-                                let _ = events.send(RxEvent::Dropped(format!(
+                                let _ = events.try_send(RxEvent::Dropped(format!(
                                     "scoring IQ alignment over {} samples\u{2026}",
                                     prefix.len()
                                 )));
@@ -3115,14 +3138,14 @@ fn build_runtime_input(
                                 );
                                 let setup = match scored.as_ref() {
                                     Some((setup, frames)) => {
-                                        let _ = events.send(RxEvent::Dropped(format!(
+                                        let _ = events.try_send(RxEvent::Dropped(format!(
                                             "IQ alignment: tuning={:.1} Hz skip={} prefix_frames={}",
                                             setup.tuning_offset_hz, setup.sample_skip, frames
                                         )));
                                         setup.clone()
                                     }
                                     None => {
-                                        let _ = events.send(RxEvent::Dropped(format!(
+                                        let _ = events.try_send(RxEvent::Dropped(format!(
                                             "IQ alignment: TOML defaults (no candidate decoded; tuning={tuning_offset_hz:.1} Hz)"
                                         )));
                                         openhoshimi_runtime::pipeline::LinearIqSetup {
@@ -3165,7 +3188,7 @@ fn build_runtime_input(
                             }
                         }
                         IoAudioMode::Fm => {
-                            let _ = events.send(RxEvent::Dropped(
+                            let _ = events.try_send(RxEvent::Dropped(
                                 "audio mode: FM (mono real-audio path; tuning override ignored)"
                                     .to_string(),
                             ));
@@ -3187,7 +3210,7 @@ fn build_runtime_input(
                             let (carrier_hz, prefix) = if audio_carrier_hz.is_finite()
                                 && audio_carrier_hz > 0.0
                             {
-                                let _ = events.send(RxEvent::Dropped(format!(
+                                let _ = events.try_send(RxEvent::Dropped(format!(
                                     "audio mode: SSB (mono->IQ via {audio_carrier_hz:.1} Hz audio carrier, user-supplied)"
                                 )));
                                 (audio_carrier_hz, Vec::new())
@@ -3209,7 +3232,7 @@ fn build_runtime_input(
                                 .ok_or_else(|| {
                                     "SSB audio carrier auto-estimate failed: no peak in audio band; set Audio Carrier manually".to_string()
                                 })?;
-                                let _ = events.send(RxEvent::Dropped(format!(
+                                let _ = events.try_send(RxEvent::Dropped(format!(
                                     "audio mode: SSB (mono->IQ via {estimate:.1} Hz audio carrier, auto-estimated)"
                                 )));
                                 (estimate, prefix)
@@ -3281,7 +3304,7 @@ fn run_alignment_thread(
     let mut source = match WavIqSource::open(&path) {
         Ok(source) => source,
         Err(err) => {
-            let _ = events.send(RxEvent::AlignmentFailed(format!(
+            let _ = events.try_send(RxEvent::AlignmentFailed(format!(
                 "failed to open IQ WAV input: {err}"
             )));
             return;
@@ -3299,7 +3322,7 @@ fn run_alignment_thread(
         let prefix = match read_iq_prefix(&mut source, prefix_len) {
             Ok(prefix) => prefix,
             Err(err) => {
-                let _ = events.send(RxEvent::AlignmentFailed(err));
+                let _ = events.try_send(RxEvent::AlignmentFailed(err));
                 return;
             }
         };
@@ -3309,7 +3332,7 @@ fn run_alignment_thread(
                 .or_else(|| estimate_iq_frequency_offset_hz(&prefix, sample_rate))
                 .filter(|v| v.is_finite());
             if let Some(estimate) = estimate {
-                let _ = events.send(RxEvent::Dropped(format!(
+                let _ = events.try_send(RxEvent::Dropped(format!(
                     "CPM carrier estimate: {estimate:.1} Hz (filename hint: {tuning:.1} Hz)"
                 )));
                 tuning = estimate;
@@ -3328,7 +3351,7 @@ fn run_alignment_thread(
             setup,
             frames: 0,
         };
-        let _ = events.send(RxEvent::AlignmentReady(Box::new(cached)));
+        let _ = events.try_send(RxEvent::AlignmentReady(Box::new(cached)));
         return;
     }
 
@@ -3336,7 +3359,7 @@ fn run_alignment_thread(
     let mut prefix = match read_iq_prefix(&mut source, prefix_len) {
         Ok(prefix) => prefix,
         Err(err) => {
-            let _ = events.send(RxEvent::AlignmentFailed(err));
+            let _ = events.try_send(RxEvent::AlignmentFailed(err));
             return;
         }
     };
@@ -3367,7 +3390,7 @@ fn run_alignment_thread(
 
     let mut scored = score_with(&prefix[..scorer_prefix_len]);
     if matches!(&scored, Some((_, frames)) if *frames == 0) && scorer_prefix_len < prefix.len() {
-        let _ = events.send(RxEvent::Dropped(format!(
+        let _ = events.try_send(RxEvent::Dropped(format!(
             "alignment scorer found 0 frames in {scorer_secs:.1} s slice; retrying with full {} s prefix",
             prefix.len() / sample_rate.max(1) as usize,
         )));
@@ -3377,7 +3400,7 @@ fn run_alignment_thread(
     let (setup, frames) = match scored {
         Some(value) => value,
         None => {
-            let _ = events.send(RxEvent::AlignmentFailed(
+            let _ = events.try_send(RxEvent::AlignmentFailed(
                 "downlink is not a linear-IQ modem".to_string(),
             ));
             return;
@@ -3398,7 +3421,7 @@ fn run_alignment_thread(
         setup,
         frames,
     };
-    let _ = events.send(RxEvent::AlignmentReady(Box::new(cached)));
+    let _ = events.try_send(RxEvent::AlignmentReady(Box::new(cached)));
 }
 
 fn emit_frames<P>(
@@ -3433,7 +3456,7 @@ fn emit_frames<P>(
                 DecodedFrame::Geoscan(geoscan) => {
                     pipeline.record_crc(geoscan.crc_ok);
                     if geoscan.crc_ok {
-                        let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+                        let _ = events.try_send(RxEvent::ImagePayload(geoscan.payload.clone()));
                     }
                 }
                 DecodedFrame::Ssdv(packet) => {
@@ -3442,7 +3465,7 @@ fn emit_frames<P>(
                         // The SSDV image reassembler re-parses the
                         // header, so it needs the *full* corrected
                         // 256-byte packet rather than just payload.
-                        let _ = events.send(RxEvent::ImagePayload(packet.raw.clone()));
+                        let _ = events.try_send(RxEvent::ImagePayload(packet.raw.clone()));
                     }
                 }
                 _ => {}
@@ -3451,10 +3474,10 @@ fn emit_frames<P>(
         let row = frame_row(*count, start.elapsed(), pipeline, &frame, telemetry);
         match row {
             Ok(row) => {
-                let _ = events.send(RxEvent::Frame(row));
+                let _ = events.try_send(RxEvent::Frame(row));
             }
             Err(err) => {
-                let _ = events.send(RxEvent::Dropped(err));
+                let _ = events.try_send(RxEvent::Dropped(err));
             }
         }
     }
@@ -3479,16 +3502,16 @@ fn emit_decoded_frames(
         // are still usable, and the reassembler's header_signature
         // check is the real filter.
         if let DecodedFrame::Geoscan(ref geoscan) = decoded {
-            let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
+            let _ = events.try_send(RxEvent::ImagePayload(geoscan.payload.clone()));
         }
         if let DecodedFrame::Ssdv(ref packet) = decoded {
             // SsdvImageReassembler reads the full corrected wire
             // bytes (sync, header, payload, CRC, parity), so forward
             // the entire packet rather than just `payload`.
-            let _ = events.send(RxEvent::ImagePayload(packet.raw.clone()));
+            let _ = events.try_send(RxEvent::ImagePayload(packet.raw.clone()));
         }
         let row = decoded_frame_row(*count, start.elapsed(), satellite, decoded, telemetry);
-        let _ = events.send(RxEvent::Frame(row));
+        let _ = events.try_send(RxEvent::Frame(row));
     }
 }
 
