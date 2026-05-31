@@ -832,7 +832,7 @@ impl eframe::App for OpenHoshimiApp {
             .show(ctx, |ui| self.toolbar(ui));
 
         egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(19.0)
+            .exact_height(24.0)
             .frame(panel_frame(Palette::BAR))
             .show(ctx, |ui| self.status_bar(ui));
 
@@ -987,7 +987,7 @@ impl OpenHoshimiApp {
             });
             ui.menu_button("Help", |ui| {
                 ui.label(
-                    RichText::new("OpenHoshimi 0.1.0")
+                    RichText::new(concat!("OpenHoshimi ", env!("CARGO_PKG_VERSION")))
                         .color(Palette::TEXT)
                         .monospace(),
                 );
@@ -1219,7 +1219,7 @@ impl OpenHoshimiApp {
             status_segment(ui, &self.source_description, Palette::MUTED);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
-                    RichText::new("OpenHoshimi 0.1.0")
+                    RichText::new(concat!("OpenHoshimi ", env!("CARGO_PKG_VERSION")))
                         .color(Palette::MUTED)
                         .monospace()
                         .size(11.0),
