@@ -255,43 +255,67 @@ fn detect_vis_code(freq: &[f32], sample_rate: u32) -> Option<(SstvMode, usize)> 
     }
 
     // Find the first sample where the running mean of the next
-    // `leader_a` samples sits within ±60 Hz of 1900 Hz; that anchor
-    // is the start of leader-A.
+    // `leader_a` samples sits within ±300 Hz of 1900 Hz.  The wide
+    // tolerance handles LEO Doppler shifts that would otherwise prevent
+    // VIS detection entirely.  The actual offset is refined below.
     let step = ms(5.0).max(1);
     let mut leader_start = None;
-    for start in (0..freq.len() - total).step_by(step) {
+    let mut leader_a_avg = 0.0f32;
+    let settle = ms(50.0);
+    'search: for start in (0..freq.len().saturating_sub(total)).step_by(step) {
         let avg = mean(&freq[start..start + leader_a]);
-        if (avg - SSTV_VIS_LEADER_HZ).abs() <= 60.0 {
-            // Walk back to find the very first sample of the leader
-            // by checking if the previous block also matched, refine
-            // by 1 ms ticks.
-            let fine_step = ms(1.0).max(1);
-            let mut anchor = start;
-            while anchor >= fine_step {
-                let candidate = anchor - fine_step;
-                let candidate_avg = mean(&freq[candidate..candidate + leader_a]);
-                if (candidate_avg - SSTV_VIS_LEADER_HZ).abs() <= 60.0 {
-                    anchor = candidate;
-                } else {
+        if (avg - SSTV_VIS_LEADER_HZ).abs() <= 300.0 {
+            let settled_start = start + settle.min(leader_a / 2);
+            let settled_avg = mean(&freq[settled_start..start + leader_a]);
+            // Validate: the break pulse must exist near the expected
+            // position.  If not, this is a false leader (Hilbert
+            // transient) and we continue searching.
+            let expected_break = start + leader_a;
+            let break_lo = expected_break.saturating_sub(break_search_window);
+            let break_hi =
+                (expected_break + break_search_window).min(freq.len().saturating_sub(break_pulse));
+            let raw_offset = settled_avg - SSTV_VIS_LEADER_HZ;
+            let offset = if raw_offset.abs() >= 50.0 {
+                raw_offset
+            } else {
+                0.0
+            };
+            for candidate in (break_lo..=break_hi).step_by(ms(1.0).max(1)) {
+                if candidate + break_pulse > freq.len() {
                     break;
                 }
+                let bavg = mean(&freq[candidate..candidate + break_pulse]);
+                if (bavg - (SSTV_SYNC_HZ + offset)).abs() <= 80.0 {
+                    leader_start = Some(start);
+                    leader_a_avg = settled_avg;
+                    break 'search;
+                }
             }
-            leader_start = Some(anchor);
-            break;
         }
     }
     let leader_start = leader_start?;
 
+    // Estimate the Doppler offset from the leader-A tone.  All
+    // subsequent frequency comparisons are shifted by this amount so
+    // the detector works under constant Doppler up to ±300 Hz.
+    // Small offsets (< 50 Hz) are likely Hilbert estimation noise on
+    // short transients rather than real Doppler; ignore them.
+    let raw_offset = leader_a_avg - SSTV_VIS_LEADER_HZ;
+    let doppler_offset = if raw_offset.abs() >= 50.0 {
+        raw_offset
+    } else {
+        0.0
+    };
+
     // Search a small window around the expected break position for
-    // the 1200 Hz break pulse. This makes the detector tolerant to
-    // small clock-drift and mis-tuned audio paths.
+    // the 1200 Hz break pulse (Doppler-corrected).
     let expected_break = leader_start + leader_a;
     let break_lo = expected_break.saturating_sub(break_search_window);
     let break_hi = (expected_break + break_search_window).min(freq.len() - break_pulse);
     let mut break_off = None;
     for candidate in (break_lo..=break_hi).step_by(ms(1.0).max(1)) {
         let avg = mean(&freq[candidate..candidate + break_pulse]);
-        if (avg - SSTV_SYNC_HZ).abs() <= 80.0 {
+        if (avg - (SSTV_SYNC_HZ + doppler_offset)).abs() <= 80.0 {
             break_off = Some(candidate);
             break;
         }
@@ -305,12 +329,12 @@ fn detect_vis_code(freq: &[f32], sample_rate: u32) -> Option<(SstvMode, usize)> 
         return None;
     }
     let leader_b_avg = mean(&freq[leader_b_off..leader_b_off + leader_b]);
-    if (leader_b_avg - SSTV_VIS_LEADER_HZ).abs() > 60.0 {
+    if (leader_b_avg - (SSTV_VIS_LEADER_HZ + doppler_offset)).abs() > 60.0 {
         return None;
     }
     let start_bit_off = leader_b_off + leader_b;
     let start_bit_avg = mean(&freq[start_bit_off..start_bit_off + start_bit]);
-    if (start_bit_avg - SSTV_SYNC_HZ).abs() > 60.0 {
+    if (start_bit_avg - (SSTV_SYNC_HZ + doppler_offset)).abs() > 60.0 {
         return None;
     }
 
@@ -320,7 +344,12 @@ fn detect_vis_code(freq: &[f32], sample_rate: u32) -> Option<(SstvMode, usize)> 
     for i in 0..8 {
         let off = data_off + i * bit_len;
         let avg = mean(&freq[off..off + bit_len]);
-        let bit = if (avg - SSTV_VIS_BIT1_HZ).abs() < (avg - SSTV_VIS_BIT0_HZ).abs() {
+        // VIS bit detection: compare distance to Doppler-shifted bit
+        // tones.  The relative spacing (1100 vs 1300) is preserved under
+        // a constant offset, so this is robust.
+        let bit1_hz = SSTV_VIS_BIT1_HZ + doppler_offset;
+        let bit0_hz = SSTV_VIS_BIT0_HZ + doppler_offset;
+        let bit = if (avg - bit1_hz).abs() < (avg - bit0_hz).abs() {
             1u8
         } else {
             0u8
@@ -345,8 +374,17 @@ fn mean(slice: &[f32]) -> f32 {
     slice.iter().sum::<f32>() / slice.len() as f32
 }
 
+#[cfg(test)]
 fn freq_to_intensity(freq: f32) -> u8 {
-    let clamped = freq.clamp(SSTV_BLACK_HZ, SSTV_WHITE_HZ);
+    freq_to_intensity_offset(freq, 0.0)
+}
+
+/// Map an instantaneous frequency to an 8-bit intensity, first removing a
+/// constant Doppler frequency offset (Hz) estimated from the line sync
+/// pulse. A positive `offset` means the received audio sits above nominal.
+fn freq_to_intensity_offset(freq: f32, offset: f32) -> u8 {
+    let corrected = freq - offset;
+    let clamped = corrected.clamp(SSTV_BLACK_HZ, SSTV_WHITE_HZ);
     let normalised = (clamped - SSTV_BLACK_HZ) / (SSTV_WHITE_HZ - SSTV_BLACK_HZ);
     (normalised * 255.0).round().clamp(0.0, 255.0) as u8
 }
@@ -385,32 +423,76 @@ fn decode_robot36(frame: &[f32], sample_rate: u32) -> SstvImage {
         is_cr: bool,
     }
 
-    let decode_row = |row: usize| -> Option<PendingRow> {
-        let line_start = row * line_len;
+    let decode_row = |line_start: usize, row: usize| -> Option<PendingRow> {
         if line_start + line_len > frame.len() {
             return None;
         }
         let line = &frame[line_start..line_start + line_len];
+        // Estimate this line's Doppler frequency offset from its 1200 Hz
+        // sync pulse.
+        let sync_mean = mean(&line[..sync_len]);
+        let offset = sync_mean - SSTV_SYNC_HZ;
+        let offset = if offset.abs() <= 500.0 { offset } else { 0.0 };
         let y_start = sync_len + porch_a;
         let y_block = &line[y_start..y_start + y_len];
         let chroma_start = y_start + y_len + separator + porch_b;
         let chroma_block = &line[chroma_start..chroma_start + chroma_len];
-        // Detect channel from the separator tone: 2300 Hz => Cr,
-        // 1500 Hz => Cb.
-        let separator_block = &line[y_start + y_len..y_start + y_len + separator];
-        let separator_mean = mean(separator_block);
-        let is_cr = (separator_mean - SSTV_WHITE_HZ).abs() < (separator_mean - SSTV_BLACK_HZ).abs();
+        // Robot36 strictly alternates Cr (even rows) / Cb (odd rows).
+        // Using row parity is more robust than separator-tone detection
+        // which can be corrupted by compression artifacts or noise.
+        let is_cr = row % 2 == 0;
         let y_samples = resample_to(y_block, width);
         let chroma_samples = resample_to(chroma_block, width);
         Some(PendingRow {
             row,
-            y: y_samples.iter().map(|f| freq_to_intensity(*f)).collect(),
+            y: y_samples
+                .iter()
+                .map(|f| freq_to_intensity_offset(*f, offset))
+                .collect(),
             chroma: chroma_samples
                 .iter()
-                .map(|f| freq_to_intensity(*f))
+                .map(|f| freq_to_intensity_offset(*f, offset))
                 .collect(),
             is_cr,
         })
+    };
+
+    // Find the start of each line by detecting the 1200 Hz sync pulse
+    // rather than using fixed timing.  This handles sample-rate drift,
+    // Doppler-induced timing changes, and imprecise VIS end positions.
+    let find_sync = |search_from: usize| -> Option<usize> {
+        // Search within ±20% of a line length from the expected position.
+        let window = line_len / 5;
+        let lo = search_from.saturating_sub(window);
+        let hi = (search_from + window).min(frame.len().saturating_sub(sync_len));
+        let coarse_step = (sync_len / 4).max(1);
+        // Coarse pass: find the approximate sync position.
+        let mut best_pos = None;
+        let mut best_dist = f32::MAX;
+        for pos in (lo..hi).step_by(coarse_step) {
+            let avg = mean(&frame[pos..pos + sync_len]);
+            let dist = (avg - SSTV_SYNC_HZ).abs();
+            if dist < best_dist && dist < 300.0 {
+                best_dist = dist;
+                best_pos = Some(pos);
+            }
+        }
+        // Fine pass: refine to single-sample accuracy around the best.
+        let coarse = best_pos?;
+        let fine_lo = coarse.saturating_sub(coarse_step);
+        let fine_hi = (coarse + coarse_step).min(hi);
+        for pos in fine_lo..=fine_hi {
+            if pos + sync_len > frame.len() {
+                break;
+            }
+            let avg = mean(&frame[pos..pos + sync_len]);
+            let dist = (avg - SSTV_SYNC_HZ).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_pos = Some(pos);
+            }
+        }
+        best_pos
     };
 
     let paint_row = |pixels: &mut [u8], row: usize, y: &[u8], cb: &[u8], cr: &[u8]| {
@@ -429,8 +511,18 @@ fn decode_robot36(frame: &[f32], sample_rate: u32) -> SstvImage {
     };
 
     let mut pending: Option<PendingRow> = None;
+    let mut line_start = 0usize;
     for row in 0..height {
-        let Some(current) = decode_row(row) else {
+        // Find the sync pulse for this line near the expected position.
+        // Fall back to fixed timing if sync detection fails (e.g. noise
+        // burst or compression artifact corrupted the sync region).
+        let expected = if row == 0 { 0 } else { line_start + line_len };
+        let sync_pos = find_sync(expected).unwrap_or(expected);
+        if sync_pos + line_len > frame.len() {
+            break;
+        }
+        line_start = sync_pos;
+        let Some(current) = decode_row(line_start, row) else {
             break;
         };
         match pending.take() {
@@ -528,6 +620,22 @@ mod tests {
         assert_eq!(freq_to_intensity(SSTV_WHITE_HZ), 255);
         let mid = freq_to_intensity((SSTV_BLACK_HZ + SSTV_WHITE_HZ) / 2.0);
         assert!((125..=130).contains(&mid));
+    }
+
+    #[test]
+    fn freq_to_intensity_offset_compensates_doppler() {
+        // A +200 Hz Doppler shift moves black to 1700 Hz and white to
+        // 2500 Hz. Without compensation black reads as mid-grey; with the
+        // measured offset removed it maps back to the correct endpoints.
+        let offset = 200.0;
+        assert!(freq_to_intensity(SSTV_BLACK_HZ + offset) > 50);
+        assert_eq!(freq_to_intensity_offset(SSTV_BLACK_HZ + offset, offset), 0);
+        assert_eq!(
+            freq_to_intensity_offset(SSTV_WHITE_HZ + offset, offset),
+            255
+        );
+        // A negative shift is handled symmetrically.
+        assert_eq!(freq_to_intensity_offset(SSTV_BLACK_HZ - 150.0, -150.0), 0);
     }
 
     #[test]
