@@ -263,16 +263,20 @@ impl JpegBuilder {
         self.height = p.height;
         self.mcu_mode = p.mcu_mode;
         self.quality = p.quality;
-        let raw_mcu = (p.raw[9] as u32) * (p.raw[10] as u32);
-        let (ycparts, mcu_count) = match self.mcu_mode & 3 {
-            0 => (4u8, raw_mcu),
-            1 => (2, raw_mcu * 2),
-            2 => (2, raw_mcu * 2),
-            3 => (1, raw_mcu * 4),
-            _ => (4, raw_mcu),
+        // Derive the MCU count from the same width/height/mode that go into
+        // the SOF0 header so the two can never disagree. Do not read
+        // `raw[9]`/`raw[10]` (non-standard layouts such as DSLWP 218-byte
+        // packets keep JPEG payload there) and do not trust the public
+        // `SsdvPacket::mcu_count` field, which a caller can set arbitrarily.
+        let (ycparts, mcu_factor) = match self.mcu_mode & 3 {
+            0 => (4u8, 1u32),
+            1 | 2 => (2, 2),
+            3 => (1, 4),
+            _ => (4, 1),
         };
         self.ycparts = ycparts;
-        self.mcu_count = mcu_count;
+        let mcus = u32::from(p.width >> 4) * u32::from(p.height >> 4) * mcu_factor;
+        self.mcu_count = mcus.min(u32::from(u16::MAX));
 
         let dqt0 = scale_dqt(&STD_DQT0, self.quality);
         let dqt1 = scale_dqt(&STD_DQT1, self.quality);
@@ -675,6 +679,7 @@ enum StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssdv::{SsdvPacket, SsdvPacketKind};
 
     #[test]
     fn jpeg_encode_int_round_trip() {
@@ -699,5 +704,72 @@ mod tests {
     fn empty_builder_produces_empty_jpeg() {
         let jb = JpegBuilder::new();
         assert!(jb.finish().is_empty());
+    }
+
+    fn test_packet(raw_9_10: (u8, u8), mcu_count: u32) -> SsdvPacket {
+        let mut raw = vec![0u8; 218];
+        raw[9] = raw_9_10.0;
+        raw[10] = raw_9_10.1;
+        SsdvPacket {
+            kind: SsdvPacketKind::NoFec,
+            callsign: String::new(),
+            image_id: 1,
+            packet_id: 0,
+            width: 320,
+            height: 240,
+            eoi: true,
+            quality: 4,
+            mcu_mode: 0,
+            mcu_offset: 0,
+            mcu_id: 0,
+            mcu_count,
+            payload: vec![0u8; SsdvPacketKind::NoFec.payload_len()],
+            rs_errors: None,
+            crc_ok: true,
+            raw,
+        }
+    }
+
+    fn build(packet: &SsdvPacket) -> Vec<u8> {
+        let mut builder = JpegBuilder::new();
+        builder.feed_packet(packet);
+        builder.finish()
+    }
+
+    #[test]
+    fn ignores_raw_dimension_bytes() {
+        // A DSLWP-style 218-byte packet keeps JPEG payload at raw[9]/raw[10].
+        // The output must be identical to a packet whose raw bytes there are
+        // the real width/height codes (320/16 = 20, 240/16 = 15).
+        let expected = build(&test_packet((20, 15), 300));
+        let jpeg = build(&test_packet((0xFF, 0xFF), 300));
+        assert!(!jpeg.is_empty());
+        assert_eq!(jpeg, expected);
+    }
+
+    #[test]
+    fn ignores_out_of_range_packet_mcu_count() {
+        // `SsdvPacket` fields are public; a bogus `mcu_count` must neither
+        // change the output nor make `finish` pad billions of MCUs.
+        let expected = build(&test_packet((0, 0), 300));
+        assert_eq!(build(&test_packet((0, 0), u32::MAX)), expected);
+        assert_eq!(build(&test_packet((0, 0), 0)), expected);
+    }
+
+    #[test]
+    fn mcu_count_follows_sampling_mode() {
+        // 320x240 is 20x15 16-pixel blocks: 300 MCUs for 2x2, 600 for
+        // 1x2 / 2x1 and 1200 for 1x1. Each padded MCU emits the same number
+        // of bytes per Y part, so just check the sizes grow accordingly.
+        let sizes: Vec<usize> = (0..4u8)
+            .map(|mode| {
+                let mut p = test_packet((0, 0), 0);
+                p.mcu_mode = mode;
+                build(&p).len()
+            })
+            .collect();
+        assert!(sizes[1] > sizes[0]);
+        assert_eq!(sizes[1], sizes[2]);
+        assert!(sizes[3] > sizes[1]);
     }
 }

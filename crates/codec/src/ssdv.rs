@@ -60,9 +60,9 @@ pub struct SsdvPacket {
     pub image_id: u8,
     /// Packet id, 0-based, monotonically increasing within an image.
     pub packet_id: u16,
-    /// Image width in pixels (`packet[9] << 4`).
+    /// Image width in pixels (the header width code times 16).
     pub width: u16,
-    /// Image height in pixels (`packet[10] << 4`).
+    /// Image height in pixels (the header height code times 16).
     pub height: u16,
     /// `true` when this packet carries the JPEG end-of-image marker
     /// (flags byte bit 2).
@@ -70,7 +70,7 @@ pub struct SsdvPacket {
     /// JPEG quality level 0..=7. Decoded as `((flags >> 3) & 7) ^ 4`
     /// per the reference implementation.
     pub quality: u8,
-    /// MCU sampling mode: 0 = 2x2, 1 = 2x1, 2 = 1x2, 3 = 1x1.
+    /// MCU sampling mode: 0 = 2x2, 1 = 1x2, 2 = 2x1, 3 = 1x1.
     pub mcu_mode: u8,
     /// Bit offset within the payload where the next fresh MCU
     /// begins, or `0xFF` when none.
@@ -78,8 +78,11 @@ pub struct SsdvPacket {
     /// MCU id of the first complete MCU in this packet, or `0xFFFF`
     /// when none.
     pub mcu_id: u16,
-    /// Total MCU count for the whole image, computed from
-    /// `width * height * mcu_mode_factor`.
+    /// Total MCU count for the whole image, computed from the
+    /// width/height header codes (pixels / 16) and the sampling-mode
+    /// factor. Always in `1..=65535` for decoded packets. `JpegBuilder`
+    /// does not read this field; it recomputes the count from
+    /// `width`, `height` and `mcu_mode`.
     pub mcu_count: u32,
     /// Payload bytes carrying the JPEG MCU stream slice.
     pub payload: Vec<u8>,
@@ -112,8 +115,8 @@ pub enum SsdvDecodeError {
     BadCrc,
     /// Header `width` or `height` field was zero.
     ZeroDimensions,
-    /// Header `mcu_id`/`mcu_offset` was inconsistent with the
-    /// computed MCU count or payload size.
+    /// Header MCU geometry was invalid: total MCU count outside
+    /// `1..=65535`, or `mcu_id`/`mcu_offset` inconsistent with it.
     BadMcu,
 }
 
@@ -124,7 +127,7 @@ impl core::fmt::Display for SsdvDecodeError {
             SsdvDecodeError::Uncorrectable => f.write_str("Reed-Solomon could not correct packet"),
             SsdvDecodeError::BadCrc => f.write_str("CRC32 mismatch"),
             SsdvDecodeError::ZeroDimensions => f.write_str("width or height is zero"),
-            SsdvDecodeError::BadMcu => f.write_str("mcu_id/mcu_offset inconsistent with MCU count"),
+            SsdvDecodeError::BadMcu => f.write_str("invalid MCU count or mcu_id/mcu_offset"),
         }
     }
 }
@@ -202,6 +205,13 @@ fn finish_packet(
     let header = parse_header(pkt);
     if header.width == 0 || header.height == 0 {
         return Err(SsdvDecodeError::ZeroDimensions);
+    }
+    // The SSDV encoder caps the total MCU count at 65535, and the DSLWP
+    // fork of the decoder rejects larger counts. fsphil's original
+    // decoder does not, so enforce it here before image assembly can pad
+    // that many MCUs.
+    if header.mcu_count == 0 || header.mcu_count > u32::from(u16::MAX) {
+        return Err(SsdvDecodeError::BadMcu);
     }
     if header.mcu_id != 0xFFFF {
         if (header.mcu_id as u32) >= header.mcu_count {
@@ -408,6 +418,17 @@ mod tests {
         pkt
     }
 
+    fn rewrite_crc(pkt: &mut [u8; SSDV_PKT_SIZE], kind: SsdvPacketKind) {
+        let payload_len = kind.payload_len();
+        let crcdata_len = SSDV_HEADER_LEN + payload_len - 1;
+        let crc = crc32(&pkt[1..1 + crcdata_len]);
+        let i = 1 + crcdata_len;
+        pkt[i] = (crc >> 24) as u8;
+        pkt[i + 1] = (crc >> 16) as u8;
+        pkt[i + 2] = (crc >> 8) as u8;
+        pkt[i + 3] = crc as u8;
+    }
+
     #[test]
     fn callsign_round_trip() {
         let code = encode_callsign("HSCAT1");
@@ -507,6 +528,20 @@ mod tests {
         assert_eq!(
             SsdvDecoder::new().decode(&buf).unwrap_err(),
             SsdvDecodeError::BadLength
+        );
+    }
+
+    #[test]
+    fn rejects_mcu_count_above_protocol_limit() {
+        // 255 * 255 * 4 = 260100 MCUs, above the SSDV limit of 65535.
+        let mut pkt = build_packet(SsdvPacketKind::NoFec, 0x10);
+        pkt[9] = 255;
+        pkt[10] = 255;
+        pkt[11] = 0x03; // mcu_mode 3, quality 4, no EOI
+        rewrite_crc(&mut pkt, SsdvPacketKind::NoFec);
+        assert_eq!(
+            SsdvDecoder::new().decode(&pkt).unwrap_err(),
+            SsdvDecodeError::BadMcu
         );
     }
 }
